@@ -1,0 +1,27 @@
+# Translation pair registry — add a pair, train, point artifact; no code change.
+# See translate/README.md
+
+default_pair: en-ta
+
+pairs:
+  en-ta:
+    src: en
+    tgt: ta
+    upstream: Helsinki-NLP/opus-mt-en-mul
+    artifact: models/export/en-ta-v1-ct2-int8
+    runtime: marian_ct2       # marian_pytorch | marian_ct2
+    device: cpu               # cpu int8 frees GPU for Whisper on Nano
+    decode:
+      beam_size: 2
+      max_new_tokens: 128
+
+  en-hi:
+    src: en
+    tgt: hi
+    upstream: Helsinki-NLP/opus-mt-en-hi
+    artifact: models/export/en-hi-v1-ct2-int8
+    runtime: marian_ct2
+    device: cpu
+    decode:
+      beam_size: 2
+      max_new_tokens: 128

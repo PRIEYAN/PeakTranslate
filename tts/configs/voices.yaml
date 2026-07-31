@@ -1,0 +1,39 @@
+# TTS voice registry — keyed by MT target language.
+# See tts/README.md
+
+default_voice: ta_custom_v1
+
+lang_to_voice:
+  ta: ta_custom_v1
+  hi: hi_official_v1
+  en: en_lessac_medium
+
+voices:
+  ta_custom_v1:
+    lang: ta
+    locale: ta_IN
+    quality: medium
+    artifact: models/export/ta_custom_v1
+    runtime: piper_cpu
+    sample_rate: 22050
+    synthesis:
+      length_scale: 1.0
+      noise_scale: 0.667
+      noise_w: 0.8
+      sentence_silence: 0.2
+
+  hi_official_v1:
+    lang: hi
+    locale: hi_IN
+    quality: medium
+    artifact: models/export/hi_official_v1
+    runtime: piper_cpu
+    sample_rate: 22050
+
+  en_lessac_medium:
+    lang: en
+    locale: en_US
+    quality: medium
+    artifact: models/export/en_lessac_medium
+    runtime: piper_cpu
+    sample_rate: 22050
