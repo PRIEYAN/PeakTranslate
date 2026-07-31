@@ -29,12 +29,13 @@ Nano has **shared** memory for CPU and GPU (~4 GB total).
 
 ### Recommended runtime policy
 
-1. **Piper always on CPU** + **ONNX Runtime CPU** (GPU ORT wheels are not drop-in on classic Nano).
-2. **Continuous queue pipeline** (Q1 transcript → Q2 translation → Q3 WAV) with workers always looping — see [04 — Real-time queue pipeline](./04-realtime-queue-pipeline.md).
-3. **GPU lock** between Whisper and Marian infer calls (logical parallelism via queues; physical CUDA time-share on 4 GB).
-4. **Default STT/MT:** Jetson **PyTorch CUDA** Whisper + Marian. Do **not** assume PyPI `faster-whisper` / CTranslate2 gives GPU on Nano (aarch64 wheels are CPU-only; CT2 CUDA often needs CUDA ≥ 11).
-5. Use **tiny/base** Whisper; one Marian pair loaded at a time.
-6. Disable unused desktop services if running headless.
+1. **STT (Whisper): CUDA only** — `require_cuda: true`, `allow_cpu_fallback: false`. Fail startup if no GPU.
+2. **MT (Marian): CUDA preferred** — share GPU lock with Whisper; **CPU fallback allowed** (e.g. CT2 int8) on OOM/contention.
+3. **Piper always on CPU** + **ONNX Runtime CPU**.
+4. **Continuous queue pipeline** (Q1 → Q2 → Q3) — see [04 — Real-time queue pipeline](./04-realtime-queue-pipeline.md).
+5. Default adapters: Jetson **PyTorch CUDA** for Whisper + Marian. Do **not** assume PyPI faster-whisper/CT2 gives GPU on Nano.
+6. Use **tiny/base** Whisper; one Marian pair loaded at a time.
+7. Disable unused desktop services if running headless.
 
 ### Swap (for queues / overflow, not model weights)
 
@@ -96,38 +97,46 @@ Normalize capture to **16 kHz mono** for Whisper.
 
 Start with **one process**, two GPU call sites serialized by a lock, Piper in a thread pool. Split processes only if you need isolation or later scale-out.
 
-### GPU lock + queues (not narrow series)
+### GPU lock + device policy
 
-Do **not** chain listen→STT→MT→TTS→play in one blocking function. Use continuous workers and Q1/Q2/Q3 as in doc 04.
+- **Whisper:** always `device=cuda`. Never fall back to CPU.
+- **Marian:** try CUDA under `gpu_lock`; on failure if `allow_cpu_fallback`, use CT2 CPU.
+- Queues keep the pipeline parallel (not a narrow series). See doc 04.
 
 ```python
 gpu_lock = threading.Lock()
 
 def whisper_worker():
+    assert torch.cuda.is_available(), "STT requires CUDA — no CPU fallback"
     while True:
         audio = audio_q.get()
         with gpu_lock:
-            text = stt.transcribe(audio)
+            text = stt.transcribe(audio)   # CUDA only
         if text.strip():
-            transcript_q.put(text)          # Q1
+            transcript_q.put(text)         # Q1
 
 def marian_worker():
     while True:
-        sent = transcript_q.get()           # pop Q1
-        with gpu_lock:
-            out = mt.translate(sent, src, tgt)
-        translation_q.put(out)              # Q2
+        sent = transcript_q.get()          # pop Q1
+        try:
+            with gpu_lock:
+                out = mt.translate(sent, src, tgt)  # CUDA preferred
+        except Exception:
+            if not mt.allow_cpu_fallback:
+                raise
+            out = mt_cpu.translate(sent, src, tgt)  # CPU fallback
+        translation_q.put(out)             # Q2
 
 def piper_worker():
     while True:
-        tr = translation_q.get()            # pop Q2
+        tr = translation_q.get()           # pop Q2
         path = tts.synthesize_to_wav(tr)
-        wav_q.put(path)                     # Q3
+        wav_q.put(path)                    # Q3
 
 def playback_worker():
     while True:
-        path = wav_q.get()                  # pop Q3
-        play_blocking(path)                 # next WAV only after this finishes
+        path = wav_q.get()                 # pop Q3
+        play_blocking(path)
 ```
 
 ---

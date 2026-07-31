@@ -22,11 +22,13 @@ It also corrects earlier docs on what runtimes actually work on the **NVIDIA Jet
 
 ### Recommended Nano MVP stack (honest)
 
-| Stage | Runtime on Nano Dev Kit |
-|-------|-------------------------|
-| STT | **Whisper `tiny` / `base.en` via Jetson PyTorch CUDA** |
-| MT | **MarianMT via same PyTorch CUDA** |
-| TTS | **Piper + ONNX Runtime CPU** |
+| Stage | Runtime on Nano Dev Kit | Fallback |
+|-------|-------------------------|----------|
+| STT | **Whisper `tiny` / `base.en` via Jetson PyTorch CUDA only** | **None** — fail if CUDA unavailable |
+| MT | **MarianMT via PyTorch CUDA** (GPU lock with Whisper) | **Allowed:** CT2 int8 on CPU if OOM/contention |
+| TTS | **Piper + ONNX Runtime CPU** | N/A |
+
+**Hard rule:** STT never silently runs on CPU. Translation may degrade to CPU; STT must not.
 
 Use Linux **swap** as overflow for **queue payloads and OS pressure**, not as the place where model weights live during inference.
 
@@ -132,39 +134,47 @@ Sentence boundary options:
 
 MVP: silence VAD → one final transcript per segment → push Q1.
 
-### 4.2 Whisper worker (CUDA, continuous)
+### 4.2 Whisper worker (CUDA only, continuous)
 
 ```text
+startup:
+  assert torch.cuda.is_available()   # HARD FAIL — no CPU Whisper
+  load whisper on device=cuda
+
 loop:
   audio = audio_queue.get()          # block
-  text  = whisper.transcribe(audio)  # GPU
+  with gpu_lock:
+      text = whisper.transcribe(audio)  # CUDA cores only
   if text.strip():
-      transcript_queue.put(sentence) # Q1 → RAM/spill metadata
+      transcript_queue.put(sentence) # Q1
 ```
 
-- Stays alive for the process lifetime.
-- While this worker runs, **MT/TTS/playback keep running on their own loops**.
-- On Nano, two CUDA models at once are tight: use a **GPU lock** so Whisper and Marian **time-share** the GPU without corrupting contexts, while still being **logically parallel** via queues (STT can have queued audio; MT can have queued sentences).
+- **No CPU fallback.** If CUDA init fails, abort the service.
+- Stays alive for the process lifetime; capture/MT/TTS keep their own loops.
+- On Nano, share a **GPU lock** with Marian when MT is also on CUDA.
 
 ```text
 Logical parallelism  = queues + independent workers
-Physical GPU        = mutex / lock between Whisper.infer and Marian.infer
+Physical GPU        = mutex between Whisper.infer and Marian.infer (when MT on CUDA)
+STT device policy    = cuda required, allow_cpu_fallback=false
 ```
 
-That is still **not** a narrow series: capture continues, Q1/Q2/Q3 absorb bursts, Piper and playback proceed on CPU while GPU flips between STT and MT.
-
-### 4.3 MarianMT worker (CUDA, parallel consumer of Q1)
+### 4.3 MarianMT worker (GPU preferred, CPU fallback OK)
 
 ```text
 loop:
   sent = transcript_queue.get()      # pop Q1
-  with gpu_lock:
-      out = marian.translate(sent.text, pair)
+  try:
+      with gpu_lock:
+          out = marian_gpu.translate(sent.text, pair)
+  except (CudaOOM, GpuUnavailable) if allow_cpu_fallback:
+      out = marian_cpu_fallback.translate(sent.text, pair)  # e.g. CT2 int8
   translation_queue.put(out)         # push Q2
 ```
 
+- Primary path: **CUDA** (same Jetson GPU, time-shared with Whisper via lock).
+- Fallback path: **CPU** only when configured (`allow_cpu_fallback: true`) and GPU path fails or is explicitly disabled for memory.
 - Pair comes from config registry (`en-ta`, etc.).
-- Runs whenever Q1 is non-empty, interleaved with Whisper under `gpu_lock`.
 
 ### 4.4 Piper worker (CPU, continuously active)
 
@@ -265,7 +275,9 @@ Do not put Whisper inside the socket handler; only enqueue audio.
 runtime:
   device: jetson_nano
   swap_spill_dir: /var/peaktranslation/spill
-  gpu_lock: true          # required on Nano when Whisper + Marian share CUDA
+  gpu_lock: true              # Whisper + Marian CUDA time-share
+  stt_cuda_only: true         # STT must never use CPU
+  mt_cpu_fallback: true       # Marian may fall back to CPU
 
 queues:
   transcript_queue: { maxsize: 32 }   # Q1
@@ -284,16 +296,23 @@ stt:
   backend: whisper_pytorch
   model: base.en          # or tiny / tiny.en
   device: cuda
+  require_cuda: true
+  allow_cpu_fallback: false   # HARD: STT never uses CPU
 
 translation:
   backend: marian_pytorch
-  device: cuda
+  device: cuda                # primary
+  allow_cpu_fallback: true
   default_pair: en-ta
   pairs:
     en-ta:
-      model_path: /opt/peaktranslation/models/marian/en-ta
+      model_path: /opt/peaktranslation/models/marian/en-ta-fp16
       src: en
       tgt: ta
+      fallback:
+        runtime: marian_ct2
+        device: cpu
+        model_path: /opt/peaktranslation/models/marian/en-ta-ct2-int8
 
 tts:
   backend: piper

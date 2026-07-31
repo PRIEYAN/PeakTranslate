@@ -6,6 +6,98 @@ Companion implementation guide: [`../../stt/README.md`](../../stt/README.md) · 
 
 ---
 
+## 0. Production-grade loosely coupled file structure
+
+STT is its **own package**. The orchestrator only talks to `STTEngine` + config. Swapping Whisper → another ASR (or PyTorch → CT2) means a new adapter under `src/runtime/`, not edits to MT/TTS.
+
+**Model weights live under `models/`** (gitignored binaries). Config points at paths; code never hardcodes Hub IDs at inference time.
+
+```text
+stt/                                      # standalone STT package (loosely coupled)
+├── README.md
+├── configs/
+│   ├── languages.yaml                    # profile registry — switch / add languages HERE
+│   ├── train_tiny_en.yaml
+│   ├── train_base_en.yaml
+│   └── decode_defaults.yaml
+├── data/
+│   ├── raw/                              # recordings (gitignored)
+│   ├── processed/
+│   │   ├── en/{train,val,test}/manifest.jsonl
+│   │   └── <lang>/{train,val,test}/manifest.jsonl
+│   └── scripts/
+│       ├── prepare_dataset.py
+│       ├── augment.py
+│       └── validate_manifest.py
+├── models/                               # ★ ALL model files stored here
+│   ├── upstream/                         # downloaded base checkpoints (gitignored)
+│   │   ├── openai-whisper-tiny.en/
+│   │   │   ├── model.safetensors | pytorch_model.bin
+│   │   │   ├── config.json
+│   │   │   ├── tokenizer.json
+│   │   │   └── preprocessor_config.json
+│   │   └── openai-whisper-base.en/
+│   ├── finetuned/                        # full-precision after training (gitignored)
+│   │   └── en-domain-v1/
+│   │       ├── model.safetensors
+│   │       ├── config.json
+│   │       ├── tokenizer* / preprocessor*
+│   │       ├── MODEL_CARD.md
+│   │       └── metrics.json              # WER before/after
+│   ├── export/                           # Nano / edge deploy artifacts (gitignored)
+│   │   ├── en-domain-v1-fp16/            # production default for Nano
+│   │   └── en-domain-v1-ct2-int8/        # optional (Orin / CPU CT2)
+│   └── .gitkeep
+├── src/
+│   ├── train.py
+│   ├── evaluate.py
+│   ├── export_fp16.py
+│   ├── export_ctranslate2.py
+│   ├── runtime/                          # adapters only — orchestrator depends on interface
+│   │   ├── interface.py                  # STTEngine protocol
+│   │   ├── whisper_pytorch.py
+│   │   ├── whisper_ct2.py
+│   │   └── registry.py                   # languages.yaml → load models/<artifact>
+│   └── jetson/
+│       ├── smoke_stt.py
+│       └── bench_latency.py
+├── scripts/
+│   ├── download_upstream.sh              # → models/upstream/
+│   ├── train.sh                          # → models/finetuned/
+│   ├── quantize_export.sh                # → models/export/
+│   └── package_for_nano.sh               # rsync models/export/<id> → device
+└── artifacts/                            # release tarballs of export/ (gitignored)
+    └── stt-en-domain-v1-nano.tar.gz
+```
+
+### Loose coupling rules
+
+| Rule | Practice |
+|------|----------|
+| Interfaces only | Pipeline imports `STTEngine`, never `whisper` directly |
+| Config = language switch | New lang/profile = folder under `models/` + entry in `languages.yaml` |
+| Models isolated | All weights under `stt/models/`; MT/TTS have their own `models/` trees |
+| Runtime swappable | `runtime: whisper_pytorch \| whisper_ct2` in YAML |
+| Device policy | `configs/languages.yaml`: `device: cuda`, `require_cuda: true`, `allow_cpu_fallback: false` |
+| Git | Commit code + YAML + `MODEL_CARD.md`; **ignore** weight binaries under `models/` |
+
+### What goes in each `models/` subfolder
+
+| Path | Contents |
+|------|----------|
+| `models/upstream/` | Untouched Hub downloads |
+| `models/finetuned/` | Train outputs (FP32/FP16 HF layout) |
+| `models/export/` | Quantized / trimmed artifacts the Nano loads |
+
+On device, mirror only what you need:
+
+```text
+/opt/peaktranslation/models/stt/
+└── en-domain-v1-fp16/          # copy of stt/models/export/en-domain-v1-fp16
+```
+
+---
+
 ## 1. Hardware constraints (why most “Jetson Whisper” blogs lie to you)
 
 | Spec | Nano Dev Kit | Implication |
@@ -202,11 +294,12 @@ Avoid:     CT2-GPU, whisper_trt, small+, concurrent huge models
 |-------|----------------|
 | OS + CUDA | 1.0–1.5 GB |
 | Whisper tiny/base | 0.5–1.0 GB |
-| Marian (prefer CPU int8 CT2) | 0.3–0.6 GB |
+| Marian (GPU primary) | 0.3–0.8 GB |
+| Marian CPU fallback (optional) | 0.3–0.6 GB if activated |
 | Piper CPU | 0.1–0.3 GB |
 | Queues / spill | keep text in RAM; WAV on disk |
 
-If OOM: drop to `tiny.en`, move Marian to **CT2 CPU**, shorten max utterance.
+If OOM: drop Whisper to `tiny.en`, enable Marian **CPU fallback**, shorten max utterance — **never** move STT to CPU.
 
 ---
 
@@ -253,4 +346,4 @@ Log: `audio_s | stt_ms | peak_ram_mb | wer_sample`.
 
 ## 12. Bottom line
 
-For **Jetson Nano Dev Kit**, production STT is **fine-tuned Whisper tiny/base.en on Jetson PyTorch CUDA**, continuously fed by VAD into a transcript queue. Treat CTranslate2 GPU INT8 and TensorRT Whisper as **next-gen Jetson (Orin)** optimizations, not prerequisites for Nano.
+For **Jetson Nano Dev Kit**, production STT is **fine-tuned Whisper tiny/base.en on Jetson PyTorch CUDA only** (`require_cuda: true`, no CPU fallback), continuously fed by VAD into a transcript queue. Treat CTranslate2 GPU INT8 and TensorRT Whisper as **next-gen Jetson (Orin)** optimizations, not prerequisites for Nano.

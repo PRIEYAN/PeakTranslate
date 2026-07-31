@@ -10,6 +10,8 @@ Text-to-text translation stage for PeakTranslation. Target: **Jetson Nano Dev Ki
 |------|----------|
 | Good domain translation | Fine-tune Helsinki-NLP / OPUS Marian on your bitext |
 | Fit Nano with Whisper + Piper | Small bilingual Marian; **one pair loaded** |
+| **GPU primary** | `device: cuda` under GPU lock with Whisper |
+| **CPU fallback allowed** | CT2 int8 if OOM (`allow_cpu_fallback: true`) |
 | Shrink weights, keep quality | FP16 → CT2 float16 → CT2 int8 with BLEU/chrF gates |
 | Easy pair switch / retrain | Pair registry + identical folder layout per pair |
 
@@ -27,16 +29,16 @@ Text-to-text translation stage for PeakTranslation. Target: **Jetson Nano Dev Ki
 
 ### Nano production choice (two valid strategies)
 
-**A — GPU Marian (default if RAM allows)**  
-Whisper and Marian **time-share CUDA** via GPU lock; both PyTorch.
+**A — GPU Marian (default / preferred)**  
+Whisper and Marian **time-share CUDA** via GPU lock; both PyTorch. Matches the product rule: **STT + MT on GPU**.
 
-**B — CPU Marian int8 (CT2) + GPU Whisper**  
-Build CT2 int8 on PC; run Translator on Nano **CPU**. Frees GPU for continuous Whisper. Worth benchmarking.
+**B — CPU Marian fallback**  
+Only when CUDA OOM or contention: CT2 int8 on CPU. Whisper **stays on CUDA** (never moves to CPU).
 
 ```text
 Train PC:  opus-mt / Marian HF → fine-tune → eval BLEU/chrF
-Export:    PyTorch pair folder  AND/OR  ct2 int8/float16
-Deploy:    Strategy A (Torch CUDA) or B (CT2 CPU int8)
+Export:    PyTorch FP16 pair folder (primary) + ct2 int8 (fallback artifact)
+Deploy:    Strategy A first; enable Strategy B via allow_cpu_fallback
 ```
 
 ---
@@ -117,9 +119,14 @@ pairs:
     src: en
     tgt: ta
     upstream: Helsinki-NLP/opus-mt-en-mul   # replace with best real base you choose
-    artifact: models/export/en-ta-v1-ct2-int8
-    runtime: marian_ct2                    # marian_pytorch | marian_ct2
-    device: cpu                            # cpu for CT2-int8 strategy on Nano
+    artifact: models/export/en-ta-v1-fp16
+    runtime: marian_pytorch                 # primary: GPU
+    device: cuda
+    allow_cpu_fallback: true
+    fallback:
+      runtime: marian_ct2
+      device: cpu
+      artifact: models/export/en-ta-v1-ct2-int8
     decode:
       beam_size: 2
       max_new_tokens: 128
@@ -128,21 +135,17 @@ pairs:
     src: en
     tgt: hi
     upstream: Helsinki-NLP/opus-mt-en-hi
-    artifact: models/export/en-hi-v1-ct2-int8
-    runtime: marian_ct2
-    device: cpu
-    decode:
-      beam_size: 2
-      max_new_tokens: 128
-
-  # GPU strategy example (if you keep Marian on CUDA)
-  en-hi-gpu:
-    src: en
-    tgt: hi
-    upstream: Helsinki-NLP/opus-mt-en-hi
     artifact: models/export/en-hi-v1-fp16
     runtime: marian_pytorch
     device: cuda
+    allow_cpu_fallback: true
+    fallback:
+      runtime: marian_ct2
+      device: cpu
+      artifact: models/export/en-hi-v1-ct2-int8
+    decode:
+      beam_size: 2
+      max_new_tokens: 128
 ```
 
 ### Switch pair at runtime
@@ -150,8 +153,8 @@ pairs:
 ```text
 pairs.yaml ──► registry.set_pair("en-hi")
                  ├─ unload previous weights
-                 ├─ load artifact for en-hi
-                 └─ expose src/tgt to TTS voice picker
+                 ├─ load CUDA artifact (primary)
+                 └─ keep CPU fallback artifact ready if allow_cpu_fallback
 ```
 
 Orchestrator only knows:
@@ -166,11 +169,11 @@ class MTEngine(Protocol):
 
 1. Create `data/processed/<src>-<tgt>/{train,val,test}.tsv`.
 2. Pick closest `upstream` Marian/OPUS model.
-3. Add `configs/train_<pair>.yaml` + entry in `pairs.yaml`.
-4. `./scripts/train_pair.sh en-fr` → fine-tune → export CT2 int8 → update `artifact:`.
+3. Add `configs/train_<pair>.yaml` + entry in `pairs.yaml` with `device: cuda`.
+4. `./scripts/train_pair.sh en-fr` → fine-tune → export FP16 (GPU) **and** CT2 int8 (CPU fallback).
 5. Add Piper voice for `tgt` in TTS registry (see `tts/`).
 
-No changes to STT or queue workers required.
+No changes to STT or queue workers required. STT stays CUDA-only even if MT falls back to CPU.
 
 ---
 
@@ -263,20 +266,22 @@ OPUS Marian bilingual checkpoints often land ~300 MB FP32; CT2 int8 commonly ~ha
 
 ## 8. Build / package runtime for Jetson Nano
 
-### Strategy A — PyTorch CUDA
+### Strategy A — PyTorch CUDA (primary)
 
 ```bash
 rsync -avP translate/models/export/en-ta-v1-fp16/ \
   nano:/opt/peaktranslation/models/mt/en-ta-v1-fp16/
 ```
 
-Nano: Jetson Torch + `transformers`. Use GPU lock with Whisper.
+Nano: Jetson Torch + `transformers`. Use GPU lock with Whisper (STT always holds CUDA priority conceptually — STT never leaves GPU).
 
-### Strategy B — CT2 CPU INT8 (often better coexistence with Whisper)
+### Strategy B — CT2 CPU INT8 (fallback only)
 
-1. On Nano, install **CPU** CTranslate2 aarch64 wheel (`pip install ctranslate2`) — this **does** work for CPU.
+Use when CUDA OOM or MT latency under lock is unacceptable. Whisper **remains on CUDA**.
+
+1. Install **CPU** CTranslate2 aarch64 wheel on Nano.
 2. Copy `en-ta-v1-ct2-int8/` to device.
-3. `pairs.yaml`: `runtime: marian_ct2`, `device: cpu`.
+3. Keep `allow_cpu_fallback: true` and `fallback:` block in `pairs.yaml` (primary still `device: cuda`).
 
 ```bash
 python translate/src/jetson/smoke_mt.py --pair en-ta --text "How are you?"
@@ -292,9 +297,10 @@ Marian worker pops **Q1** transcripts, pushes **Q2** translations (`docs/04-real
 
 | Mode | Whisper | Marian | Note |
 |------|---------|--------|------|
-| A | CUDA | CUDA | GPU lock; tiny Whisper + small Marian |
-| B | CUDA | CT2 CPU int8 | Prefer if OOM / contention |
-| Never | Load all pairs at once | — | Load **one** pair; swap on demand |
+| **A (default)** | **CUDA only** | **CUDA** | GPU lock; tiny Whisper + small Marian |
+| B (fallback) | **CUDA only** | CT2 CPU int8 | If OOM / contention — STT still never CPU |
+| Forbidden | CPU | any | STT must not run on CPU |
+| Never | — | Load all pairs | Load **one** pair; swap on demand |
 
 ---
 

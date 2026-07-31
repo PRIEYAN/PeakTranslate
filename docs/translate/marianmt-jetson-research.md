@@ -6,6 +6,103 @@ Companion: [`../../translate/README.md`](../../translate/README.md) · [`../../t
 
 ---
 
+## 0. Production-grade loosely coupled file structure
+
+Translation is a **standalone package**. STT/TTS never import Marian internals. Adding `en-fr` = new bitext + train + files under `models/` + one `pairs.yaml` row.
+
+**Every checkpoint and quantized export is stored under `models/`.**
+
+```text
+translate/                                # standalone MT package (loosely coupled)
+├── README.md
+├── configs/
+│   ├── pairs.yaml                        # pair registry — switch / add pairs HERE
+│   ├── train_en_ta.yaml
+│   ├── train_en_hi.yaml
+│   └── decode.yaml
+├── data/
+│   ├── raw/                              # OPUS / in-house bitext dumps (gitignored)
+│   ├── processed/
+│   │   ├── en-ta/{train,val,test}.tsv    # src\ttgt
+│   │   └── en-hi/{train,val,test}.tsv
+│   └── scripts/
+│       ├── download_opus.py
+│       ├── clean_bitext.py
+│       └── split_corpus.py
+├── models/                               # ★ ALL model files stored here
+│   ├── upstream/                         # Hub OPUS/Marian bases (gitignored)
+│   │   ├── opus-mt-en-hi/
+│   │   │   ├── pytorch_model.bin | model.safetensors
+│   │   │   ├── config.json
+│   │   │   ├── tokenizer* / source.spm / target.spm
+│   │   │   └── vocab.json
+│   │   └── opus-mt-en-mul/
+│   ├── finetuned/                        # after domain fine-tune (gitignored)
+│   │   ├── en-ta-v1/
+│   │   │   ├── model.safetensors
+│   │   │   ├── config.json
+│   │   │   ├── tokenizer* / *.spm
+│   │   │   ├── MODEL_CARD.md
+│   │   │   └── metrics.json              # BLEU / chrF
+│   │   └── en-hi-v1/
+│   ├── export/                           # Nano deploy artifacts (gitignored)
+│   │   ├── en-ta-v1-ct2-int8/            # preferred Nano coexistence w/ Whisper
+│   │   │   ├── model.bin                 # CTranslate2
+│   │   │   ├── config.json
+│   │   │   └── tokenizer / spm files
+│   │   ├── en-ta-v1-fp16/                # Torch CUDA alternative
+│   │   ├── en-hi-v1-ct2-int8/
+│   │   └── en-hi-v1-fp16/
+│   └── .gitkeep
+├── src/
+│   ├── train.py
+│   ├── evaluate.py
+│   ├── export_fp16.py
+│   ├── export_ctranslate2.py
+│   ├── runtime/                          # adapters — orchestrator uses MTEngine only
+│   │   ├── interface.py                  # MTEngine protocol
+│   │   ├── marian_pytorch.py
+│   │   ├── marian_ct2.py
+│   │   └── registry.py                   # pairs.yaml → load models/export/<pair>
+│   └── jetson/
+│       ├── smoke_mt.py
+│       └── bench_pairs.py
+├── scripts/
+│   ├── download_upstream.sh              # → models/upstream/
+│   ├── train_pair.sh                     # → models/finetuned/
+│   ├── quantize_export.sh                # → models/export/
+│   └── package_for_nano.sh               # rsync one pair export → device
+└── artifacts/
+    └── mt-en-ta-v1-nano.tar.gz
+```
+
+### Loose coupling rules
+
+| Rule | Practice |
+|------|----------|
+| One pair = one folder | `models/finetuned/<pair>-vN` and `models/export/<pair>-vN-…` |
+| Switch via registry | `registry.set_pair("en-hi")` unloads old weights, loads new `models/export/…` |
+| No cross-imports | STT/TTS never open Marian files; only consume Q1→Q2 text |
+| Runtime choice in YAML | `marian_ct2` (CPU int8) vs `marian_pytorch` (CUDA) |
+| Git | Ignore `models/upstream`, `models/finetuned`, `models/export` binaries |
+
+### What goes in each `models/` subfolder
+
+| Path | Contents |
+|------|----------|
+| `models/upstream/` | Downloaded Helsinki-NLP / OPUS bases |
+| `models/finetuned/` | Trained pair checkpoints + metrics |
+| `models/export/` | CT2 int8 / FP16 trees the Jetson loads |
+
+On device (one active pair):
+
+```text
+/opt/peaktranslation/models/mt/
+└── en-ta-v1-ct2-int8/          # from translate/models/export/en-ta-v1-ct2-int8
+```
+
+---
+
 ## 1. Why MarianMT (not an LLM) on Nano
 
 | Criterion | Marian / OPUS-MT | LLM translator |
@@ -86,21 +183,18 @@ So even a heroic CT2-CUDA build on Nano would **not** unlock Orin-like int8 GPU 
 
 ```text
 ┌─────────────────────────────────────────────────────────┐
-│  BEST COEXISTENCE WITH CONTINUOUS WHISPER ON NANO       │
-│                                                         │
-│  Whisper  → Jetson PyTorch CUDA                         │
-│  Marian   → CTranslate2 INT8 on CPU (converted on PC)   │
+│  DEVICE POLICY                                          │
+│  Whisper  → Jetson PyTorch CUDA ONLY (no CPU fallback)  │
+│  Marian   → PyTorch CUDA primary + CT2 CPU fallback OK  │
 │  Piper    → ONNX Runtime CPU                            │
 └─────────────────────────────────────────────────────────┘
 ```
 
-Alternative if CT2 CPU latency is too high for your sentences: Marian **PyTorch CUDA** with GPU lock (STT and MT alternate). Benchmark both.
-
 | Strategy | Whisper | Marian | When |
 |----------|---------|--------|------|
-| **B (prefer)** | CUDA | CT2 CPU int8 | OOM / GPU contention |
-| **A** | CUDA | Torch CUDA + lock | Short MT latency critical |
-| Avoid | CUDA | Load many pairs | Swap one pair at a time |
+| **A (default)** | CUDA only | CUDA + GPU lock | Normal operation |
+| **B (fallback)** | CUDA only | CT2 CPU int8 | OOM / GPU contention |
+| Forbidden | CPU | — | Never for STT |
 
 ---
 
@@ -263,10 +357,10 @@ Measure: `mt_ms`, RSS, BLEU on a tiny on-device phrase set.
 
 | Question | Answer for Nano Dev Kit |
 |----------|-------------------------|
-| Best shrink path? | Fine-tune small OPUS → **CT2 int8** on PC |
-| Best runtime with live Whisper? | **CT2 CPU int8** Marian |
-| GPU Marian? | Possible via Torch + lock; watch OOM |
-| CT2 GPU int8? | Not a Nano win (CC 5.3 fallbacks; build pain) |
+| Best shrink path? | Fine-tune small OPUS → FP16 for GPU + CT2 int8 for CPU fallback |
+| Best runtime with live Whisper? | **Marian on CUDA** (lock); CPU only if fallback needed |
+| STT interaction | Whisper **never** leaves CUDA |
+| CT2 GPU int8? | Not a Nano win (CC 5.3); CT2 CPU is the MT fallback |
 | Easy new language? | New folder + `pairs.yaml` entry + TTS voice |
 
 ---
@@ -283,4 +377,4 @@ Measure: `mt_ms`, RSS, BLEU on a tiny on-device phrase set.
 
 ## 12. Bottom line
 
-Treat translation as **one quantized bilingual artifact per pair**. On classic Nano, run **Marian as CT2 INT8 on CPU** so Whisper can own CUDA; switch languages by registry, not by rewriting the pipeline.
+Treat translation as **one bilingual artifact per pair**, primary on **GPU**. On classic Nano, run Marian on **CUDA with a GPU lock shared with Whisper**; keep **CT2 INT8 CPU** as optional fallback only. Switch languages by registry, not by rewriting the pipeline.

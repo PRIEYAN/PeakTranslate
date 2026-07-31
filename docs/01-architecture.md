@@ -4,8 +4,8 @@ Real-time speech translation on **NVIDIA Jetson Nano**: speech in → translated
 
 | Stage | Model | Device |
 |-------|--------|--------|
-| STT | Whisper | GPU |
-| Translation | MarianMT | GPU |
+| STT | Whisper | **GPU/CUDA only** (no CPU fallback) |
+| Translation | MarianMT | **GPU preferred**; CPU fallback allowed |
 | TTS | Piper | CPU |
 
 ---
@@ -142,7 +142,7 @@ The orchestrator never imports `transformers` or `whisper` directly — only ada
 3. **MT** loads (or already holds) the model for `src→tgt` from the pair registry → emits `Translation`.
 4. **TTS** picks voice for `tgt_lang` → emits `SpeechAudio` → playback.
 
-GPU time-share: Whisper and MarianMT both use CUDA under a **GPU lock** while queues keep the pipeline logically parallel. Piper (CPU) and serial playback run independently. Details: [04 — Real-time queue pipeline](./04-realtime-queue-pipeline.md).
+**Device policy:** Whisper **must** run on Jetson CUDA (refuse CPU). MarianMT prefers CUDA under the same **GPU lock**; if GPU is saturated/OOM it may fall back to CPU (e.g. CT2 int8). Piper stays on CPU. Details: [04 — Real-time queue pipeline](./04-realtime-queue-pipeline.md).
 
 ---
 

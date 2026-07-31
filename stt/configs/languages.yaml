@@ -1,5 +1,8 @@
 # STT language profiles — switch / train by editing this file.
 # See stt/README.md
+#
+# POLICY: STT runs on Jetson CUDA ONLY. No CPU fallback.
+# If cuda is unavailable, the service must fail fast (do not silently use CPU).
 
 default_profile: en_domain_v1
 
@@ -9,8 +12,10 @@ profiles:
     multilingual: false
     upstream: openai/whisper-tiny.en
     artifact: models/export/en-domain-v1-fp16
-    runtime: whisper_pytorch  # whisper_pytorch | whisper_ct2
-    device: cuda
+    runtime: whisper_pytorch  # must be a CUDA-capable adapter
+    device: cuda              # REQUIRED — never cpu
+    require_cuda: true        # fail startup if torch.cuda.is_available() is false
+    allow_cpu_fallback: false
     sample_rate: 16000
     decode:
       beam_size: 1
@@ -24,6 +29,8 @@ profiles:
     artifact: models/export/en-base-v1-fp16
     runtime: whisper_pytorch
     device: cuda
+    require_cuda: true
+    allow_cpu_fallback: false
     sample_rate: 16000
     decode:
       beam_size: 1

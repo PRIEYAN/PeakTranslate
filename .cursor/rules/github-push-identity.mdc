@@ -1,0 +1,13 @@
+---
+description: Push/git only via user's GitHub account (PRIEYAN), never Cursor's
+alwaysApply: true
+---
+
+# GitHub push identity
+
+- **Never** push, create PRs, or authenticate git/GitHub operations using a Cursor-managed or Cursor shared GitHub account.
+- Use **only** the user's GitHub account: **PRIEYAN** (`mnprieyan@gmail.com`).
+- Remote for this repo: `https://github.com/PRIEYAN/PeakTranslate`.
+- Before any `git push` or `gh` network write: verify `gh auth status` shows **PRIEYAN** as the active user. If auth is missing/invalid, **stop** and ask the user to run `gh auth login` (do not fall back to another account).
+- Do not rewrite `git config user.*` to a Cursor identity. Commits should remain under the user's name/email already configured for this repo when committing on their behalf.
+- If push credentials would use a different account than PRIEYAN, abort and tell the user.

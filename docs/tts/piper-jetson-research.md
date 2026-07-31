@@ -6,6 +6,108 @@ Companion: [`../../tts/README.md`](../../tts/README.md) · [`../../tts/configs/v
 
 ---
 
+## 0. Production-grade loosely coupled file structure
+
+TTS is a **standalone package**. The pipeline only calls `TTSEngine`. MT exposes `tgt` lang; TTS registry maps that to a voice under **`models/`**. No Piper paths hardcoded in STT or Marian code.
+
+**All voice ONNX files and training checkpoints are stored under `models/`.**
+
+```text
+tts/                                      # standalone TTS package (loosely coupled)
+├── README.md
+├── configs/
+│   ├── voices.yaml                       # lang → voice registry — switch HERE
+│   ├── train_ta_custom.yaml
+│   └── synthesis.yaml
+├── data/
+│   ├── raw/                              # studio / mic recordings (gitignored)
+│   ├── processed/
+│   │   ├── ta_custom_v1/                 # LJSpeech-like
+│   │   │   ├── wavs/
+│   │   │   └── metadata.csv
+│   │   └── hi_custom_v1/
+│   └── scripts/
+│       ├── normalize_audio.py
+│       ├── build_ljspeech.py
+│       └── validate_dataset.py
+├── models/                               # ★ ALL model / voice files stored here
+│   ├── upstream/                         # official Piper downloads (gitignored)
+│   │   ├── en_US-lessac-medium.onnx
+│   │   ├── en_US-lessac-medium.onnx.json
+│   │   ├── ta_IN-<voice>-medium.onnx
+│   │   └── ta_IN-<voice>-medium.onnx.json
+│   ├── checkpoints/                      # PyTorch Lightning ckpts while training (gitignored)
+│   │   └── ta_custom_v1/
+│   │       └── epoch=N.ckpt
+│   ├── finetuned/                        # raw export before optimize (gitignored)
+│   │   └── ta_custom_v1/
+│   │       ├── ta_custom_v1.onnx
+│   │       ├── ta_custom_v1.onnx.json
+│   │       └── MODEL_CARD.md
+│   ├── export/                           # production voices for Nano (gitignored)
+│   │   ├── ta_custom_v1/
+│   │   │   ├── voice.onnx                # onnxsim / optional quant
+│   │   │   ├── voice.onnx.json
+│   │   │   ├── MODEL_CARD.md
+│   │   │   └── metrics.json              # RTF, listening notes
+│   │   ├── hi_official_v1/
+│   │   │   ├── voice.onnx
+│   │   │   └── voice.onnx.json
+│   │   └── en_lessac_medium/
+│   │       ├── voice.onnx
+│   │       └── voice.onnx.json
+│   └── .gitkeep
+├── src/
+│   ├── train_prep.py
+│   ├── export_onnx.py
+│   ├── optimize_onnx.py
+│   ├── evaluate_rtf.py
+│   ├── runtime/                          # adapters — orchestrator uses TTSEngine only
+│   │   ├── interface.py                  # TTSEngine protocol
+│   │   ├── piper_cpu.py
+│   │   └── registry.py                   # voices.yaml → load models/export/<voice>
+│   └── jetson/
+│       ├── smoke_tts.py
+│       └── bench_rtf.py
+├── scripts/
+│   ├── download_voices.sh                # → models/upstream/
+│   ├── train_voice.sh                    # → models/checkpoints/ + finetuned/
+│   ├── export_and_optimize.sh            # → models/export/
+│   └── package_for_nano.sh               # rsync models/export/<voice> → device
+└── artifacts/
+    └── tts-ta-custom-v1-nano.tar.gz
+```
+
+### Loose coupling rules
+
+| Rule | Practice |
+|------|----------|
+| Voice = folder | Each production voice is `models/export/<voice_id>/{voice.onnx,voice.onnx.json}` |
+| Lang switch via YAML | `lang_to_voice[tgt]` → artifact path; MT only provides `tgt` code |
+| No cross-imports | STT/MT never open ONNX files |
+| One runtime adapter | `piper_cpu` today; swap backend later behind `TTSEngine` |
+| Git | Ignore ONNX/ckpt binaries under `models/`; commit YAML + cards |
+
+### What goes in each `models/` subfolder
+
+| Path | Contents |
+|------|----------|
+| `models/upstream/` | Downloaded official `.onnx` + `.onnx.json` |
+| `models/checkpoints/` | Training `.ckpt` (PC only) |
+| `models/finetuned/` | First ONNX export from training |
+| `models/export/` | Optimized voices the Jetson loads |
+
+On device:
+
+```text
+/opt/peaktranslation/models/tts/
+├── ta_custom_v1/voice.onnx
+├── ta_custom_v1/voice.onnx.json
+└── en_lessac_medium/...
+```
+
+---
+
 ## 1. Why Piper for Nano
 
 | Need | Piper |
@@ -291,4 +393,4 @@ If RAM still tight: drop Piper to **low**, ensure only one voice loaded, delete 
 
 ## 13. Bottom line
 
-On the **Jetson Nano Dev Kit**, Piper is the right TTS: **CPU ONNX**, medium/low voices, registry-switched by target language, continuously draining Q2 into Q3 with **strictly serial playback**. Leave CUDA to Whisper; leave Marian on CT2 CPU when possible.
+On the **Jetson Nano Dev Kit**, Piper is the right TTS: **CPU ONNX**, medium/low voices, registry-switched by target language, continuously draining Q2 into Q3 with **strictly serial playback**. Leave **CUDA to Whisper (required)** and **Marian (preferred, CPU fallback OK)**.

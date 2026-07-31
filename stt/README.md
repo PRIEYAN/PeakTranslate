@@ -11,6 +11,7 @@ Speech-to-text stage for PeakTranslation. Target device: **NVIDIA Jetson Nano De
 | Good accuracy on domain speech | Fine-tune `tiny` / `base` (or `.en`) on your mic data |
 | Small enough for Nano | Prefer **tiny → base**; avoid `small+` on classic Nano |
 | Fast enough for realtime queue | FP16 where supported; INT8 only when runtime exists |
+| **CUDA only on Jetson** | `require_cuda: true` — **no CPU fallback**; fail if no GPU |
 | Easy language switch / retrain | Locale registry + one artifact tree per lang profile |
 
 ---
@@ -112,8 +113,10 @@ profiles:
     multilingual: false
     upstream: openai/whisper-tiny.en   # or local models/upstream/...
     artifact: models/export/en-domain-v1-fp16
-    runtime: whisper_pytorch           # whisper_pytorch | whisper_ct2
-    device: cuda
+    runtime: whisper_pytorch           # CUDA-capable adapter only
+    device: cuda                       # REQUIRED
+    require_cuda: true
+    allow_cpu_fallback: false          # HARD: never CPU
     sample_rate: 16000
     decode:
       beam_size: 1                     # lower = faster on Nano
@@ -126,6 +129,8 @@ profiles:
     artifact: models/export/en-base-v1-fp16
     runtime: whisper_pytorch
     device: cuda
+    require_cuda: true
+    allow_cpu_fallback: false
 
   # Example: add Tamil-capable multilingual later
   ta_multilingual_v1:
@@ -135,10 +140,14 @@ profiles:
     artifact: models/export/ta-multi-v1-fp16
     runtime: whisper_pytorch
     device: cuda
+    require_cuda: true
+    allow_cpu_fallback: false
     decode:
       language: ta
       task: transcribe
 ```
+
+**Device policy:** If `torch.cuda.is_available()` is false at startup, **abort** — do not load Whisper on CPU.
 
 ### How to switch or train a new language
 
