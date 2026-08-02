@@ -1,0 +1,85 @@
+# Secrets & env
+.env
+.env.*
+!.env.example
+
+# Local junk / scratch
+TEST
+*.tmp
+*.bak
+
+# Hugging Face / caches
+.hf_cache/
+.cache/
+**/huggingface/
+**/transformers/
+**/datasets/
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.eggs/
+dist/
+build/
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Model weights & large binary artifacts (keep folder placeholders)
+**/models/upstream/**
+**/models/finetuned/**
+**/models/export/**
+**/models/checkpoints/**
+!**/models/**/.gitkeep
+
+# Audio / datasets (keep placeholders + scripts)
+**/data/raw/**
+**/data/processed/**
+!**/data/**/.gitkeep
+!**/data/scripts/**
+!**/data/**/README.md
+
+**/artifacts/**
+!**/artifacts/.gitkeep
+
+# Common weight / audio extensions (belt & suspenders)
+*.safetensors
+*.bin
+*.onnx
+*.pt
+*.pth
+*.ckpt
+*.wav
+*.flac
+*.mp3
+*.ogg
+*.tar
+*.tar.gz
+*.tgz
+*.zip
+
+# Training outputs / logs
+wandb/
+runs/
+outputs/
+lightning_logs/
+*.log
+
+# OS / IDE
+.DS_Store
+Thumbs.db
+*.swp
+*~
+.idea/
+.vscode/
+*.code-workspace
+
+# Spill / runtime
+**/spill/
+/tmp/
