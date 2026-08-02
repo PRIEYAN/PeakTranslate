@@ -1,32 +1,37 @@
-# STT language profiles — switch / train by editing this file.
-# See stt/README.md
+# STT language profiles — English + Hindi on whisper-base (multilingual)
 #
-# POLICY: STT runs on Jetson CUDA ONLY. No CPU fallback.
-# If cuda is unavailable, the service must fail fast (do not silently use CPU).
+# POLICY: Jetson STT = CUDA ONLY. No CPU fallback.
+# Fine-tune goal: transcribe real speech (en/hi); ignore non-speech
+# vocalizations (scream / laugh / moan / cry) → empty transcript.
 
-default_profile: en_domain_v1
+default_profile: en_hi_base_v1
 
 profiles:
-  en_domain_v1:
-    lang_code: en
-    multilingual: false
-    upstream: openai/whisper-tiny.en
-    artifact: models/export/en-domain-v1-fp16
-    runtime: whisper_pytorch  # must be a CUDA-capable adapter
-    device: cuda              # REQUIRED — never cpu
-    require_cuda: true        # fail startup if torch.cuda.is_available() is false
+  # Single multilingual checkpoint covering en + hi after fine-tune
+  en_hi_base_v1:
+    lang_code: multilingual
+    languages: [en, hi]
+    multilingual: true
+    upstream: openai/whisper-base
+    artifact: models/export/en-hi-base-v1-fp16
+    finetuned: models/finetuned/en-hi-base-v1
+    runtime: whisper_pytorch
+    device: cuda
+    require_cuda: true
     allow_cpu_fallback: false
     sample_rate: 16000
     decode:
       beam_size: 1
-      language: en
+      # null = auto-detect between en/hi after multilingual fine-tune
+      language: null
       task: transcribe
 
-  en_base_v1:
+  en_only:
     lang_code: en
-    multilingual: false
-    upstream: openai/whisper-base.en
-    artifact: models/export/en-base-v1-fp16
+    languages: [en]
+    multilingual: true
+    upstream: openai/whisper-base
+    artifact: models/export/en-hi-base-v1-fp16
     runtime: whisper_pytorch
     device: cuda
     require_cuda: true
@@ -35,4 +40,20 @@ profiles:
     decode:
       beam_size: 1
       language: en
+      task: transcribe
+
+  hi_only:
+    lang_code: hi
+    languages: [hi]
+    multilingual: true
+    upstream: openai/whisper-base
+    artifact: models/export/en-hi-base-v1-fp16
+    runtime: whisper_pytorch
+    device: cuda
+    require_cuda: true
+    allow_cpu_fallback: false
+    sample_rate: 16000
+    decode:
+      beam_size: 1
+      language: hi
       task: transcribe

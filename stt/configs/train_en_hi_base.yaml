@@ -1,0 +1,40 @@
+# Fine-tune openai/whisper-base for PeakTranslation STT (PC training)
+# Goal: strong en/hi speech WER; suppress non-speech vocalizations (empty label)
+
+model_name_or_path: openai/whisper-base
+output_dir: models/finetuned/en-hi-base-v1
+
+# Manifests produced by data/scripts/prepare_common_voice.py + merge_nonspeech.py
+train_manifest: data/processed/en-hi/train/manifest.jsonl
+val_manifest: data/processed/en-hi/val/manifest.jsonl
+test_manifest: data/processed/en-hi/test/manifest.jsonl
+
+# Training
+num_train_epochs: 3
+per_device_train_batch_size: 2
+per_device_eval_batch_size: 2
+gradient_accumulation_steps: 8
+learning_rate: 1.0e-5
+warmup_ratio: 0.05
+fp16: true
+gradient_checkpointing: true
+logging_steps: 25
+eval_strategy: steps
+eval_steps: 200
+save_steps: 200
+save_total_limit: 2
+predict_with_generate: true
+generation_max_length: 225
+dataloader_num_workers: 2
+seed: 42
+
+# Language sampling: null = free; or force during train via language column
+# Non-speech rows use text="" and language="und" (undefined)
+
+# Freeze encoder for first N epochs-equivalent steps (0 = full fine-tune)
+freeze_encoder: false
+
+# Early stop on val WER
+load_best_model_at_end: true
+metric_for_best_model: wer
+greater_is_better: false
