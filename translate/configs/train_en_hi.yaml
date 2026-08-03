@@ -1,0 +1,39 @@
+# Fine-tune Helsinki-NLP/opus-mt-en-hi on PC (4GB GPU–safe)
+
+model_name_or_path: Helsinki-NLP/opus-mt-en-hi
+output_dir: models/finetuned/en-hi-v1
+
+train_file: data/processed/en-hi/train.tsv
+val_file: data/processed/en-hi/val.tsv
+test_file: data/processed/en-hi/test.tsv
+
+src_lang: en
+tgt_lang: hi
+max_source_length: 96
+max_target_length: 96
+
+num_train_epochs: 3
+per_device_train_batch_size: 4
+per_device_eval_batch_size: 4
+gradient_accumulation_steps: 8
+learning_rate: 5.0e-5
+warmup_ratio: 0.06
+fp16: true
+gradient_checkpointing: true
+weight_decay: 0.01
+logging_steps: 50
+eval_strategy: steps
+eval_steps: 1000
+save_steps: 1000
+save_total_limit: 2
+# BLEU generate-eval is VRAM-heavy on 4GB — use loss for best checkpoint
+predict_with_generate: false
+generation_max_length: 96
+dataloader_num_workers: 0
+seed: 42
+load_best_model_at_end: true
+metric_for_best_model: eval_loss
+greater_is_better: false
+max_train_samples: 40000
+max_val_samples: 1000
+max_test_samples: 1000

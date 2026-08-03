@@ -1,0 +1,14 @@
+torch>=2.1.0
+transformers>=4.40.0
+datasets>=2.19.0
+accelerate>=0.30.0
+sentencepiece>=0.2.0
+sacrebleu>=2.4.0
+evaluate>=0.4.0
+PyYAML>=6.0
+huggingface_hub>=0.23.0
+python-dotenv>=1.0.0
+tqdm>=4.66.0
+numpy>=1.24.0
+# Optional CPU fallback export for Jetson:
+# ctranslate2>=4.0.0

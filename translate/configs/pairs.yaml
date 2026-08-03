@@ -1,33 +1,15 @@
-# Translation pair registry — add a pair, train, point artifact; no code change.
-# See translate/README.md
-#
-# POLICY: Prefer GPU (CUDA) for MarianMT on Jetson.
-# CPU is allowed only as explicit fallback (OOM / CUDA contention / CT2-CPU path).
+# Translation pair registry
+# POLICY: GPU primary; CPU fallback allowed for Marian only.
 
-default_pair: en-ta
+default_pair: en-hi
 
 pairs:
-  en-ta:
-    src: en
-    tgt: ta
-    upstream: Helsinki-NLP/opus-mt-en-mul
-    artifact: models/export/en-ta-v1-fp16
-    runtime: marian_pytorch     # primary: GPU
-    device: cuda                # primary device
-    allow_cpu_fallback: true    # if CUDA OOM / lock starvation, may use CT2 CPU
-    fallback:
-      runtime: marian_ct2
-      device: cpu
-      artifact: models/export/en-ta-v1-ct2-int8
-    decode:
-      beam_size: 2
-      max_new_tokens: 128
-
   en-hi:
     src: en
     tgt: hi
     upstream: Helsinki-NLP/opus-mt-en-hi
     artifact: models/export/en-hi-v1-fp16
+    finetuned: models/finetuned/en-hi-v1
     runtime: marian_pytorch
     device: cuda
     allow_cpu_fallback: true
@@ -35,6 +17,22 @@ pairs:
       runtime: marian_ct2
       device: cpu
       artifact: models/export/en-hi-v1-ct2-int8
+    decode:
+      beam_size: 2
+      max_new_tokens: 128
+
+  en-ta:
+    src: en
+    tgt: ta
+    upstream: Helsinki-NLP/opus-mt-en-mul
+    artifact: models/export/en-ta-v1-fp16
+    runtime: marian_pytorch
+    device: cuda
+    allow_cpu_fallback: true
+    fallback:
+      runtime: marian_ct2
+      device: cpu
+      artifact: models/export/en-ta-v1-ct2-int8
     decode:
       beam_size: 2
       max_new_tokens: 128
