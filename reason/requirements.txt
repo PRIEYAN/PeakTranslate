@@ -1,0 +1,5 @@
+# reason/ deps only. torch/transformers/accelerate come from
+# stt/requirements.txt and translate/requirements.txt (already installed for
+# the pipeline). See docs/reasoningModel/01-gemma-reasoning-mode.md §16.
+bitsandbytes>=0.43.0
+PyYAML>=6.0

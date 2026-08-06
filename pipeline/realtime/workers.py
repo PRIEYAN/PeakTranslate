@@ -24,7 +24,8 @@ import time
 from pathlib import Path
 from typing import Optional
 
-from .messages import STOP, Sentence, Translation, Utterance, WavJob
+from .messages import STOP, Abort, Reply, Sentence, Translation, Utterance, WavJob
+from .noise import is_noise_transcript
 
 log = logging.getLogger("peaktranslation.realtime")
 
@@ -59,6 +60,7 @@ def stt_worker(
     stop_event: threading.Event,
     language: str = "en",
     beam_size: int = 1,
+    drop_noise_transcripts: bool = True,
 ) -> None:
     try:
         import sys
@@ -110,15 +112,21 @@ def stt_worker(
             log.exception("[%s] STT failed on this utterance; skipping.", utt.utt_id)
             continue
 
-        if not tr.text.strip():
+        text = tr.text.strip()
+        if not text:
             log.info("[%s] STT (%.0f ms): <non-speech, dropped>", utt.utt_id, t_stt)
             continue
+        if drop_noise_transcripts and is_noise_transcript(text):
+            # Whisper loves to hallucinate "you"/"Bye"/"mm" on USB-mic hiss —
+            # never let those reach Gemma or the assistant chat-spams itself.
+            log.info("[%s] STT (%.0f ms): %r <noise/filler, dropped>", utt.utt_id, t_stt, text)
+            continue
 
-        log.info("[%s] STT (%.0f ms): %r", utt.utt_id, t_stt, tr.text)
+        log.info("[%s] STT (%.0f ms): %r", utt.utt_id, t_stt, text)
         transcript_queue.put(
             Sentence(
                 utt_id=utt.utt_id,
-                text=tr.text.strip(),
+                text=text,
                 src_lang=language,
                 t_captured=utt.t_captured,
                 t_stt_done=time.perf_counter(),
@@ -274,10 +282,21 @@ def tts_worker(
     wav_queue: "queue.Queue",
     stop_event: threading.Event,
     sample_rate: int = 22050,
+    interrupt_event: Optional[threading.Event] = None,
+    voices: Optional[dict[str, Path]] = None,
 ) -> None:
+    """Synthesize Q2 text to WAV.
+
+    `voice_onnx` is the default (translate mode, or reason fallback).
+    `voices` optionally maps language codes (`hi`, `en`, ...) → onnx paths
+    so reason mode can speak Hindi with the Hindi Piper and English /
+    Latin-transliterated Tamil with the English Piper.
+    """
     try:
         spill_dir.mkdir(parents=True, exist_ok=True)
-        log.info("TTS ready (voice=%s).", voice_onnx)
+        voice_map = dict(voices or {})
+        voice_map.setdefault("default", voice_onnx)
+        log.info("TTS ready (voices=%s).", {k: str(v) for k, v in voice_map.items()})
     except Exception:
         log.exception("TTS worker failed to start — pipeline cannot continue.")
         stop_event.set()
@@ -292,18 +311,36 @@ def tts_worker(
         if item is STOP:
             wav_queue.put(STOP)
             break
-        tr: Translation = item
+        if isinstance(item, Abort):
+            # Forward immediately — playback needs this to kill audio that's
+            # already mid-play. See messages.py and doc §19.
+            wav_queue.put(item)
+            continue
+        if interrupt_event is not None and interrupt_event.is_set():
+            continue
+        tr: Translation | Reply = item
+        if not tr.text.strip():
+            # Reason mode's end-of-utterance marker (Reply.is_last with empty
+            # text) and any other empty chunk land here — nothing to speak.
+            continue
 
-        out_wav = spill_dir / f"{tr.utt_id}.wav"
+        # `seq` defaults to 0 for Translation (one chunk per utterance, byte-
+        # for-byte unchanged filename). Reason mode's Reply has a real `seq`
+        # per streamed sentence; without it in the filename, chunk 2 would
+        # overwrite chunk 1 while playback might still be reading it.
+        seq = getattr(tr, "seq", 0)
+        out_wav = spill_dir / f"{tr.utt_id}-{seq}.wav"
+        lang = getattr(tr, "out_lang", None) or getattr(tr, "tgt_lang", None) or "default"
+        voice = voice_map.get(lang) or voice_map.get("en") or voice_map["default"]
         t0 = time.perf_counter()
         try:
-            _piper_synth(tr.text, voice_onnx, out_wav)
+            _piper_synth(tr.text, voice, out_wav)
         except Exception:
             log.exception("[%s] TTS failed; dropping.", tr.utt_id)
             continue
         t_tts = (time.perf_counter() - t0) * 1000
 
-        log.info("[%s] TTS (%.0f ms): %s", tr.utt_id, t_tts, out_wav)
+        log.info("[%s] TTS (%.0f ms, lang=%s): %s", tr.utt_id, t_tts, lang, out_wav)
         wav_queue.put(
             WavJob(
                 utt_id=tr.utt_id,
@@ -311,6 +348,7 @@ def tts_worker(
                 sample_rate=sample_rate,
                 t_captured=tr.t_captured,
                 t_tts_done=time.perf_counter(),
+                is_last=getattr(tr, "is_last", True),
             )
         )
 
@@ -323,6 +361,8 @@ def playback_worker(
     stop_event: threading.Event,
     keep_wavs: bool = False,
     log_latency: bool = True,
+    speaking: Optional[threading.Event] = None,
+    interrupt_event: Optional[threading.Event] = None,
 ) -> None:
     from .audio_out import play_wav_blocking
 
@@ -334,6 +374,12 @@ def playback_worker(
             continue
         if item is STOP:
             break
+        if isinstance(item, Abort):
+            # Nothing queued to play for this utt_id by construction (Q2/Q3
+            # are strict FIFO and reasoning_worker stops producing for it the
+            # instant it aborts) — this is just a marker; log and move on.
+            log.info("[%s] Reply aborted by barge-in.", item.utt_id)
+            continue
         job: WavJob = item
 
         if log_latency:
@@ -341,9 +387,20 @@ def playback_worker(
             log.info("[%s] VAD-close -> audio-out: %.0f ms", job.utt_id, total_ms)
 
         try:
-            play_wav_blocking(job.wav_path)
+            play_wav_blocking(job.wav_path, interrupt=interrupt_event)
         except Exception:
             log.exception("[%s] Playback failed.", job.utt_id)
+        finally:
+            # Only playback knows when sound has actually stopped, so only
+            # playback clears the mute — and only after the LAST chunk of a
+            # reply, not every chunk. Cleared even if playback raised, or a
+            # synthesis failure would leave the mic muted forever. A beat
+            # late so the tail of the speaker output doesn't leak into the
+            # first unmuted frame (docs/reasoningModel/01-gemma-reasoning-
+            # mode.md §14).
+            if speaking is not None and job.is_last:
+                time.sleep(0.2)
+                speaking.clear()
 
         if not keep_wavs:
             try:

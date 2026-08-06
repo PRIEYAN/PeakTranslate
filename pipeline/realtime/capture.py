@@ -15,9 +15,10 @@ import queue
 import threading
 import time
 import uuid
-from typing import Optional
+from typing import Callable, Optional
 
 from .messages import STOP, Utterance
+from .noise import pcm_peak_abs
 
 log = logging.getLogger("peaktranslation.realtime")
 
@@ -40,6 +41,8 @@ class VadEndpointer:
         max_utterance_ms: int = 10000,
         pre_roll_ms: int = 200,
         backend: str = "webrtc",
+        on_speech_start: Optional[Callable[[], None]] = None,
+        speech_start_debounce_ms: int = 150,
     ) -> None:
         self.sample_rate = sample_rate
         self.frame_ms = frame_ms
@@ -50,6 +53,19 @@ class VadEndpointer:
         self.max_speech_frames = max(1, max_utterance_ms // frame_ms)
         pre_roll_frames = max(0, pre_roll_ms // frame_ms)
         self._pre_roll: collections.deque[bytes] = collections.deque(maxlen=pre_roll_frames)
+        # Fired once sustained speech is detected — after
+        # `speech_start_debounce_ms` of *consecutive* speech frames, not the
+        # very first 20ms frame. A single frame is noise-prone (clicks, room
+        # hiss, a stray consonant) and firing on it made barge-in trigger on
+        # things that were never real speech; it still stays far faster than
+        # waiting for the ~500ms silence_ms full endpointing needs. This
+        # timing is independent of utterance segmentation below (which still
+        # starts buffering from frame 1, unaffected) — it only gates the
+        # callback. See docs/reasoningModel/01-gemma-reasoning-mode.md §19.
+        self._on_speech_start = on_speech_start
+        self._speech_start_debounce_frames = max(1, speech_start_debounce_ms // frame_ms)
+        self._speech_run = 0
+        self._speech_start_fired = False
 
         if backend == "webrtc":
             import webrtcvad
@@ -74,6 +90,12 @@ class VadEndpointer:
         rms = float(np.sqrt(np.mean(samples**2))) if len(samples) else 0.0
         return rms > 500.0
 
+    def _fire_speech_start(self) -> None:
+        if self._speech_start_fired or self._on_speech_start is None:
+            return
+        self._speech_start_fired = True
+        self._on_speech_start()
+
     def push_frame(self, frame: bytes) -> Optional[bytes]:
         """Feed one fixed-size PCM frame. Returns completed utterance PCM, if any."""
         if len(frame) != self.frame_bytes:
@@ -87,13 +109,24 @@ class VadEndpointer:
                 self._speaking = True
                 self._speech_frames = list(self._pre_roll)
                 self._silence_run = 0
+                self._speech_run = 1
+                self._speech_start_fired = False
+                if self._speech_start_debounce_frames <= 1:
+                    self._fire_speech_start()
             return None
 
         self._speech_frames.append(frame)
         if is_speech:
             self._silence_run = 0
+            self._speech_run += 1
+            if self._speech_run >= self._speech_start_debounce_frames:
+                self._fire_speech_start()
         else:
             self._silence_run += 1
+            # Require *consecutive* speech frames — any gap resets the count,
+            # so an isolated blip followed by silence never accumulates
+            # across unrelated noise.
+            self._speech_run = 0
 
         force_cut = len(self._speech_frames) >= self.max_speech_frames
         silence_cut = self._silence_run >= self.silence_frames
@@ -127,6 +160,9 @@ class AudioCapture:
         device: Optional[str] = None,
         vad_kwargs: Optional[dict] = None,
         on_drop=None,
+        speaking: Optional[threading.Event] = None,
+        on_speech_start: Optional[Callable[[], None]] = None,
+        min_peak_abs: int = 0,
     ) -> None:
         self.audio_queue = audio_queue
         self.sample_rate = sample_rate
@@ -134,10 +170,21 @@ class AudioCapture:
         self.frame_bytes = int(sample_rate * frame_ms / 1000) * 2
         self.device = device
         self.on_drop = on_drop or (lambda utt_id: None)
+        # Set by reason mode while the assistant is speaking, so the mic
+        # doesn't hear (and reply to) its own voice through the speakers.
+        # Discarded, not buffered — buffering would replay the assistant's
+        # own voice the moment capture unmutes. None (never mutes) when
+        # barge-in is enabled — see docs/reasoningModel/01-gemma-reasoning-
+        # mode.md §14 and §19.
+        self._speaking = speaking
+        # Drop endpointed utterances quieter than this (0 = disabled). Stops
+        # USB-mic hiss / room noise from becoming Whisper "you"/"Bye".
+        self._min_peak_abs = max(0, int(min_peak_abs))
 
         self._endpointer = VadEndpointer(
             sample_rate=sample_rate,
             frame_ms=frame_ms,
+            on_speech_start=on_speech_start,
             **(vad_kwargs or {}),
         )
         self._raw_frames: "queue.Queue[bytes]" = queue.Queue()
@@ -187,12 +234,23 @@ class AudioCapture:
             buf += self._resample_to_target(chunk)
             while len(buf) >= self.frame_bytes:
                 frame, buf = buf[: self.frame_bytes], buf[self.frame_bytes :]
+                if self._speaking is not None and self._speaking.is_set():
+                    continue  # discard; do not feed VAD, do not buffer
                 self._log_level(frame)
                 utt_pcm = self._endpointer.push_frame(frame)
                 if utt_pcm is not None:
                     self._emit(utt_pcm)
 
     def _emit(self, pcm: bytes) -> None:
+        if self._min_peak_abs > 0:
+            peak = pcm_peak_abs(pcm)
+            if peak < self._min_peak_abs:
+                log.info(
+                    "Dropped quiet utterance (peak=%d < min_peak_abs=%d)",
+                    peak,
+                    self._min_peak_abs,
+                )
+                return
         utt_id = f"{int(time.time() * 1000)}-{uuid.uuid4().hex[:6]}"
         utt = Utterance(
             utt_id=utt_id,

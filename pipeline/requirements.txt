@@ -12,3 +12,9 @@ numpy>=1.24.0
 # Real-time only (docs/05-vad-realtime-integration.md)
 sounddevice>=0.4.6
 webrtcvad>=2.0.10
+
+# --mode reason needs reason/requirements.txt too (bitsandbytes):
+#   pip install -r reason/requirements.txt
+# Not included via -r here on purpose — bitsandbytes needs a CUDA-matched
+# build and shouldn't be a hard dependency for translate-only setups.
+# See docs/reasoningModel/01-gemma-reasoning-mode.md §16.

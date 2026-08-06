@@ -1,0 +1,36 @@
+# Reasoning-model profile registry (switch model here).
+# Mirrors translate/configs/pairs.yaml and stt/configs/languages.yaml.
+# See docs/reasoningModel/01-gemma-reasoning-mode.md §8.
+
+default_profile: gemma-2-2b-it-4bit
+
+profiles:
+  gemma-2-2b-it-4bit:
+    model_id: google/gemma-2-2b-it     # gated; needs HF_TOKEN in .env
+    runtime: gemma_pytorch
+    device: cuda
+    quantization: nf4                  # nf4 | none — mandatory on 4 GB (see §5)
+    compute_dtype: bfloat16
+    # Default speech-lang key when a chunk has no detectable script.
+    # Per-chunk language is chosen from the reply text (hi vs en Piper).
+    out_lang: en
+    prompt: configs/prompts/voice_assistant.md
+    decode:
+      max_new_tokens: 96
+      temperature: 0.6
+      top_p: 0.9
+    history_turns: 4                   # 0 disables multi-turn context
+
+  gemma-2b-it-4bit:                    # older model, same shape, smaller
+    model_id: google/gemma-2b-it
+    runtime: gemma_pytorch
+    device: cuda
+    quantization: nf4
+    compute_dtype: bfloat16
+    out_lang: en
+    prompt: configs/prompts/voice_assistant.md
+    decode:
+      max_new_tokens: 96
+      temperature: 0.6
+      top_p: 0.9
+    history_turns: 4

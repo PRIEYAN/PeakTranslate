@@ -110,3 +110,30 @@ venv/bin/python pipeline/run_realtime.py --device USB
 
 To make it permanent, set `capture.device` in `pipeline/config/realtime.yaml`
 to the same index or name instead of passing `--device` every time.
+
+#### F) Reason mode (Gemma chat instead of translation)
+
+Design: [docs/reasoningModel/01-gemma-reasoning-mode.md](../docs/reasoningModel/01-gemma-reasoning-mode.md).
+`translate` (above) stays the default; this is an alternate text stage
+selected with `--mode`, or `mode: reason` in the config:
+
+```bash
+venv/bin/pip install -r reason/requirements.txt   # bitsandbytes, once
+
+# text only — Gemma replies printed, NO Piper (bring-up / debug)
+venv/bin/python pipeline/run_realtime.py --mode reason --stage mt --device 19
+
+# full Jarvis-style loop: mic → Whisper → Gemma → Piper → speakers
+# `--stage full` is required for Piper; `--stage mt` never starts TTS.
+venv/bin/python pipeline/run_realtime.py --mode reason --stage full --device 19
+```
+
+Jarvis-style assistant: Gemma answers in the language you ask for
+("explain blockchain in Tamil" → Tamil via Latin transliteration for
+speech; Hindi → Devanagari + Hindi Piper). No MarianMT in this mode.
+
+Noise control (USB mics): stricter VAD, quiet-utterance drop, and a
+filler filter that discards Whisper hallucinations like `"you"` / `"Bye"`
+before they reach Gemma. Mic is muted while the assistant speaks
+(`barge_in: false` by default) so speaker bleed can't start a spam loop.
+Enable `reason.barge_in: true` only with headphones — see doc §14/§19.

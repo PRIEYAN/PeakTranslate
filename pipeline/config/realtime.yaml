@@ -2,6 +2,10 @@
 # See docs/05-vad-realtime-integration.md §8.
 # Paths are relative to the repo root.
 
+# Which text stage runs between STT and TTS: translate | reason.
+# See docs/reasoningModel/01-gemma-reasoning-mode.md. Override with --mode.
+mode: translate
+
 capture:
   # null = system default input device (not always your USB mic!). Run
   # `venv/bin/python pipeline/run_realtime.py --list-devices` to see indices,
@@ -9,13 +13,19 @@ capture:
   device: null
   sample_rate: 16000
   frame_ms: 20
+  # Drop endpointed chunks quieter than this (int16 peak). Cuts USB-mic
+  # hiss before Whisper can hallucinate "you"/"Bye". Raise if real speech
+  # is being dropped; lower if quiet speech is missed.
+  min_peak_abs: 2500
   vad:
     backend: webrtc        # webrtc | energy
-    aggressiveness: 2
-    silence_ms: 500
-    min_utterance_ms: 300
+    aggressiveness: 3      # 0–3; 3 = strictest (less noise → speech)
+    silence_ms: 700
+    min_utterance_ms: 700
     max_utterance_ms: 10000
     pre_roll_ms: 200
+    # reason.barge_in only (doc §19): consecutive speech before barge-in.
+    speech_start_debounce_ms: 300
 
 queues:
   audio_queue: { maxsize: 8 }        # Q0 — drop-oldest on full (in capture.py)
@@ -27,8 +37,10 @@ stt:
   model_dir: stt/models/export/en-hi-base-v1-fp16
   language: en
   beam_size: 1
+  # Drop Whisper filler/hallucinations ("you", "mm", "Bye", …) before Gemma.
+  drop_noise_transcripts: true
 
-translate:
+translate:                             # unchanged by reason mode — still the default path
   pair: en-hi
   tgt_lang: hi
   model_dir: translate/models/export/en-hi-v1-fp16
@@ -36,6 +48,22 @@ translate:
   allow_cpu_fallback: true
   max_new_tokens: 96
   num_beams: 2
+
+# mode: reason only. Model knobs live in reason/configs/profiles.yaml.
+# Jarvis-style assistant: Gemma picks reply language; Piper voices below.
+reason:
+  profile: gemma-2-2b-it-4bit
+  # Default / Hindi / English Piper. Tamil & others → Latin transliteration
+  # spoken with the English voice (no Tamil Piper voice in-repo).
+  voice: tts/models/export/en_lessac_medium/voice.onnx
+  voices:
+    en: tts/models/export/en_lessac_medium/voice.onnx
+    hi: tts/models/export/hi_official_v1/voice.onnx
+  # OFF by default: open speakers + Boya USB cause a barge-in death spiral
+  # (assistant hears itself → "you" → new reply forever). Use headphones
+  # and set true only after noise is under control — see doc §19.
+  barge_in: false
+  mute_capture_while_replying: true
 
 tts:
   voice: tts/models/export/hi_official_v1/voice.onnx

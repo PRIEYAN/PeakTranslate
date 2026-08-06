@@ -2,19 +2,27 @@
 """
 Real-time VAD speech-to-speech pipeline entrypoint (PC).
 
-Always-listening English mic -> Whisper (CUDA) -> MarianMT (CUDA, CPU
-fallback allowed) -> Piper (CPU) -> serial speaker playback.
+Always-listening English mic -> Whisper (CUDA) -> a text stage -> Piper
+(CPU) -> serial speaker playback. The text stage is chosen by `--mode` /
+`mode` in the config and is one of:
+
+  translate  (default)  MarianMT (CUDA, CPU fallback allowed), en -> hi
+  reason                 Gemma Jarvis assistant (CUDA, 4-bit), multilingual
+                          see docs/reasoningModel/01-gemma-reasoning-mode.md
+                          barge_in default OFF (mute mic while speaking —
+                          safer on USB mics / open speakers; see doc §19).
 
 Design: docs/05-vad-realtime-integration.md
 Build order (do these in sequence when first bringing this up):
   1. --stage capture    dump VAD-segmented utterances to spill/, no models
   2. --stage stt        add live transcripts
-  3. --stage mt         add translations
+  3. --stage mt         add the text-stage output (translation or reply)
   4. --stage full       (default) complete loop with playback
 
 Requires:
   pip: sounddevice webrtcvad piper-tts onnxruntime soundfile librosa
        transformers torch pyyaml
+  Reason mode also needs: bitsandbytes (reason/requirements.txt)
   System: PortAudio (for sounddevice), aplay/paplay/ffplay (for playback)
 """
 from __future__ import annotations
@@ -39,8 +47,9 @@ import yaml  # noqa: E402
 from dotenv import load_dotenv  # noqa: E402
 
 from pipeline.realtime.capture import AudioCapture  # noqa: E402
-from pipeline.realtime.messages import STOP  # noqa: E402
+from pipeline.realtime.messages import STOP, Abort  # noqa: E402
 from pipeline.realtime.workers import (  # noqa: E402
+    MODEL_LOAD_LOCK,
     mt_worker,
     playback_worker,
     stt_worker,
@@ -76,6 +85,17 @@ def main() -> int:
         help="Bring-up stage: how far down the pipeline to run (see module docstring).",
     )
     parser.add_argument(
+        "--mode",
+        choices=["translate", "reason"],
+        default=None,
+        help="Text stage between STT and TTS. Overrides `mode` in the config.",
+    )
+    parser.add_argument(
+        "--reason-profile",
+        default=None,
+        help="Override reason.profile (see reason/configs/profiles.yaml).",
+    )
+    parser.add_argument(
         "--device",
         default=None,
         help="Input device index or name substring (e.g. 'USB'). Overrides "
@@ -103,24 +123,71 @@ def main() -> int:
         format="%(asctime)s %(levelname)s %(message)s",
     )
 
+    mode = args.mode or cfg.get("mode", "translate")
+    if mode not in ("translate", "reason"):
+        print(f"Unknown mode: {mode!r} (use 'translate' or 'reason')", file=sys.stderr)
+        return 1
+    # Barge-in only makes sense (and is only wired up) in reason mode — see
+    # docs/reasoningModel/01-gemma-reasoning-mode.md §19. Requires capture to
+    # stay unmuted while replying, which trades away the echo protection
+    # `mute_capture_while_replying` gives on open speakers.
+    # Default OFF: open speakers + USB mics cause a barge-in death spiral.
+    barge_in = mode == "reason" and bool(cfg.get("reason", {}).get("barge_in", False))
+    mute_while_replying = mode == "reason" and (
+        not barge_in and bool(cfg.get("reason", {}).get("mute_capture_while_replying", True))
+    )
+
     stt_model_dir = resolve(ROOT, cfg["stt"]["model_dir"])
-    mt_model_dir = resolve(ROOT, cfg["translate"]["model_dir"])
-    mt_fallback_dir = resolve(ROOT, cfg["translate"].get("fallback_model_dir"))
-    voice_onnx = resolve(ROOT, cfg["tts"]["voice"])
+    # Modes are mutually exclusive (docs/reasoningModel/01-gemma-reasoning-mode.md
+    # §5): reason mode never loads Marian, translate mode never loads Gemma.
+    reason_voices: dict[str, Path] = {}
+    if mode == "translate":
+        mt_model_dir = resolve(ROOT, cfg["translate"]["model_dir"])
+        mt_fallback_dir = resolve(ROOT, cfg["translate"].get("fallback_model_dir"))
+        voice_onnx = resolve(ROOT, cfg["tts"]["voice"])
+    else:
+        mt_model_dir = None
+        mt_fallback_dir = None
+        r_cfg_early = cfg["reason"]
+        voice_onnx = resolve(ROOT, r_cfg_early["voice"])
+        for lang_key, rel in (r_cfg_early.get("voices") or {}).items():
+            p = resolve(ROOT, rel)
+            if p is not None:
+                reason_voices[lang_key] = p
+        reason_voices.setdefault("default", voice_onnx)
+        reason_voices.setdefault("en", voice_onnx)
     spill_dir = resolve(ROOT, cfg["runtime"]["spill_dir"])
 
     if args.stage in ("stt", "mt", "full") and not stt_model_dir.exists():
         print(f"Missing STT model: {stt_model_dir}", file=sys.stderr)
         return 1
-    if args.stage in ("mt", "full") and not mt_model_dir.exists():
+    if mode == "translate" and args.stage in ("mt", "full") and not mt_model_dir.exists():
         print(f"Missing MT model: {mt_model_dir}", file=sys.stderr)
         return 1
-    if args.stage == "full" and not voice_onnx.exists():
-        print(
-            f"Missing Piper voice: {voice_onnx}\nRun: bash tts/scripts/download_voices.sh",
-            file=sys.stderr,
+    if args.stage == "full":
+        missing = [str(p) for p in ([voice_onnx] + list(reason_voices.values())) if not p.exists()]
+        missing_u = list(dict.fromkeys(missing))
+        if missing_u:
+            print(
+                "Missing Piper voice(s):\n  "
+                + "\n  ".join(missing_u)
+                + "\nRun: bash tts/scripts/download_voices.sh",
+                file=sys.stderr,
+            )
+            return 1
+    if mode == "reason" and args.stage in ("mt", "full"):
+        # reason.model_id is a Hub id resolved at load time, not a local
+        # path — it can't be preflight-checked here. Log it and let the
+        # loader raise the real HF error (e.g. a 401 if the Gemma licence
+        # hasn't been accepted) instead of a generic missing-file message.
+        r_cfg = cfg["reason"]
+        profile_id = args.reason_profile or r_cfg["profile"]
+        log.info(
+            "Reason mode: profile=%s barge_in=%s mute_while_replying=%s",
+            profile_id,
+            barge_in,
+            mute_while_replying,
         )
-        return 1
 
     q_cfg = cfg["queues"]
     audio_queue: "queue.Queue" = queue.Queue(maxsize=q_cfg["audio_queue"]["maxsize"])
@@ -130,12 +197,30 @@ def main() -> int:
 
     gpu_lock = threading.Lock()
     stop_event = threading.Event()
+    # Set by the reasoning worker while the assistant is speaking, cleared by
+    # playback once sound actually stops (or by reasoning_worker itself on a
+    # barge-in/failure). Translate mode never touches it, so capture behaves
+    # exactly as before. See docs/reasoningModel/01-gemma-reasoning-mode.md §14.
+    speaking = threading.Event()
+    # Set the instant a barge-in is detected; cleared by reasoning_worker at
+    # the start of the next utterance. Only meaningful when barge_in is on —
+    # see doc §19.
+    interrupt_event = threading.Event()
 
     drop_count = {"n": 0}
 
     def on_drop(utt_id: str) -> None:
         drop_count["n"] += 1
         log.warning("[%s] Q0 audio_queue full — dropped oldest (total drops: %d)", utt_id, drop_count["n"])
+
+    def on_speech_start() -> None:
+        # Fires on every speech onset (one 20ms frame), not just during a
+        # reply — only treat it as a barge-in if the assistant is actually
+        # talking right now. Without acoustic echo cancellation this can
+        # also fire on the assistant's own voice leaking into the mic; see
+        # doc §19 for the tradeoff and how to tune it.
+        if speaking.is_set():
+            interrupt_event.set()
 
     cap_cfg = cfg["capture"]
     device = args.device if args.device is not None else cap_cfg.get("device")
@@ -151,6 +236,10 @@ def main() -> int:
         device=device,
         vad_kwargs=cap_cfg["vad"],
         on_drop=on_drop,
+        # Muting and barge-in are mutually exclusive (doc §14 vs §19).
+        speaking=speaking if mute_while_replying else None,
+        on_speech_start=on_speech_start if barge_in else None,
+        min_peak_abs=int(cap_cfg.get("min_peak_abs") or 0),
     )
 
     if args.stage in ("stt", "mt", "full"):
@@ -171,6 +260,8 @@ def main() -> int:
             WhisperForConditionalGeneration,
             WhisperProcessor,
         )
+        if mode == "reason":
+            from transformers import AutoModelForCausalLM, BitsAndBytesConfig  # noqa: F401
 
     threads: list[threading.Thread] = []
 
@@ -212,6 +303,7 @@ def main() -> int:
                 stop_event=stop_event,
                 language=cfg["stt"]["language"],
                 beam_size=cfg["stt"]["beam_size"],
+                drop_noise_transcripts=bool(cfg["stt"].get("drop_noise_transcripts", True)),
             ),
         )
         t_stt.start()
@@ -234,25 +326,66 @@ def main() -> int:
             threads.append(t)
 
         else:
-            t_mt = threading.Thread(
-                target=mt_worker,
-                name="mt",
-                daemon=True,
-                kwargs=dict(
-                    model_dir=mt_model_dir,
-                    fallback_model_dir=mt_fallback_dir,
-                    tgt_lang=cfg["translate"]["tgt_lang"],
-                    transcript_queue=transcript_queue,
-                    translation_queue=translation_queue,
-                    gpu_lock=gpu_lock,
-                    stop_event=stop_event,
-                    max_new_tokens=cfg["translate"]["max_new_tokens"],
-                    num_beams=cfg["translate"]["num_beams"],
-                    allow_cpu_fallback=cfg["translate"]["allow_cpu_fallback"],
-                ),
-            )
-            t_mt.start()
-            threads.append(t_mt)
+            if mode == "reason":
+                from pipeline.realtime.reasoning import reasoning_worker
+                from reason.src.runtime import ConversationHistory, build_engine, load_system_prompt
+                from reason.src.runtime.registry import resolve_profile
+                from reason.src.runtime.streaming import SentenceAssembler
+
+                r_cfg = cfg["reason"]
+                profile_id = args.reason_profile or r_cfg["profile"]
+                # out_lang / history_turns are model knobs and live in the
+                # profile (reason/configs/profiles.yaml), not the pipeline
+                # config — see doc §8.
+                profile = resolve_profile(profile_id)
+                # Built on the main thread, not inside the worker: a bad
+                # profile, missing licence, or CUDA OOM fails here — before
+                # the mic opens — with a clean traceback instead of a dead
+                # daemon thread. Injected with the SAME lock STT uses, since
+                # a lock only helps if every racing thread takes the same
+                # one (docs/06-debugging-meta-tensor-load-race.md).
+                engine = build_engine(profile_id, load_lock=MODEL_LOAD_LOCK)
+                t_text = threading.Thread(
+                    target=reasoning_worker,
+                    name="reason",
+                    daemon=True,
+                    kwargs=dict(
+                        engine=engine,
+                        history=ConversationHistory(max_turns=profile.get("history_turns", 4)),
+                        assembler_factory=SentenceAssembler,
+                        system_prompt=load_system_prompt(profile_id),
+                        transcript_queue=transcript_queue,
+                        reply_queue=translation_queue,
+                        gpu_lock=gpu_lock,
+                        stop_event=stop_event,
+                        out_lang=profile.get("out_lang", "en"),
+                        # Always set/cleared: needed for `on_speech_start`'s
+                        # barge-in gate even when `mute_capture_while_replying`
+                        # is what's actually muting capture (barge_in=False).
+                        speaking=speaking,
+                        interrupt_event=interrupt_event if barge_in else None,
+                    ),
+                )
+            else:
+                t_text = threading.Thread(
+                    target=mt_worker,
+                    name="mt",
+                    daemon=True,
+                    kwargs=dict(
+                        model_dir=mt_model_dir,
+                        fallback_model_dir=mt_fallback_dir,
+                        tgt_lang=cfg["translate"]["tgt_lang"],
+                        transcript_queue=transcript_queue,
+                        translation_queue=translation_queue,
+                        gpu_lock=gpu_lock,
+                        stop_event=stop_event,
+                        max_new_tokens=cfg["translate"]["max_new_tokens"],
+                        num_beams=cfg["translate"]["num_beams"],
+                        allow_cpu_fallback=cfg["translate"]["allow_cpu_fallback"],
+                    ),
+                )
+            t_text.start()
+            threads.append(t_text)
 
             if args.stage == "mt":
 
@@ -264,7 +397,14 @@ def main() -> int:
                             continue
                         if item is STOP:
                             break
-                        log.info("[%s] TRANSLATION (%s): %r", item.utt_id, item.tgt_lang, item.text)
+                        if isinstance(item, Abort):
+                            log.info("[%s] Reply aborted by barge-in.", item.utt_id)
+                            continue
+                        if not item.text.strip():
+                            continue  # reason mode's end-of-utterance marker
+                        # Translation has `tgt_lang`; Reply has `out_lang`.
+                        lang = getattr(item, "tgt_lang", None) or getattr(item, "out_lang", "?")
+                        log.info("[%s] TEXT (%s): %r", item.utt_id, lang, item.text)
 
                 t = threading.Thread(target=print_loop, name="print", daemon=True)
                 t.start()
@@ -282,6 +422,8 @@ def main() -> int:
                         wav_queue=wav_queue,
                         stop_event=stop_event,
                         sample_rate=cfg["tts"]["sample_rate"],
+                        interrupt_event=interrupt_event if barge_in else None,
+                        voices=reason_voices if mode == "reason" else None,
                     ),
                 )
                 t_tts.start()
@@ -296,6 +438,8 @@ def main() -> int:
                         stop_event=stop_event,
                         keep_wavs=cfg["playback"]["keep_wavs"],
                         log_latency=cfg["runtime"]["log_latency"],
+                        speaking=speaking,
+                        interrupt_event=interrupt_event if barge_in else None,
                     ),
                 )
                 t_play.start()
