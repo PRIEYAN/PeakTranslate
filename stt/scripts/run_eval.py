@@ -73,7 +73,8 @@ def main() -> int:
         if lang == "und":
             lang = "en"
         inputs = processor(speech, sampling_rate=16000, return_tensors="pt")
-        feats = inputs.input_features.to("cuda")
+        # fp16 exports need the fp32 mel features cast to the weight dtype
+        feats = inputs.input_features.to("cuda", dtype=model.dtype)
         forced = processor.get_decoder_prompt_ids(language=lang, task="transcribe")
         with torch.inference_mode():
             ids = model.generate(feats, forced_decoder_ids=forced, max_new_tokens=225)

@@ -1,0 +1,51 @@
+# Real-time VAD speech-to-speech pipeline config (PC).
+# See docs/05-vad-realtime-integration.md §8.
+# Paths are relative to the repo root.
+
+capture:
+  # null = system default input device (not always your USB mic!). Run
+  # `venv/bin/python pipeline/run_realtime.py --list-devices` to see indices,
+  # then set this to an index (e.g. 3) or a name substring (e.g. "USB").
+  device: null
+  sample_rate: 16000
+  frame_ms: 20
+  vad:
+    backend: webrtc        # webrtc | energy
+    aggressiveness: 2
+    silence_ms: 500
+    min_utterance_ms: 300
+    max_utterance_ms: 10000
+    pre_roll_ms: 200
+
+queues:
+  audio_queue: { maxsize: 8 }        # Q0 — drop-oldest on full (in capture.py)
+  transcript_queue: { maxsize: 32 }  # Q1 — blocks STT worker on full
+  translation_queue: { maxsize: 32 } # Q2 — blocks MT worker on full
+  wav_queue: { maxsize: 8 }          # Q3 — blocks TTS worker on full
+
+stt:
+  model_dir: stt/models/export/en-hi-base-v1-fp16
+  language: en
+  beam_size: 1
+
+translate:
+  pair: en-hi
+  tgt_lang: hi
+  model_dir: translate/models/export/en-hi-v1-fp16
+  fallback_model_dir: translate/models/export/en-hi-v1-ct2-int8
+  allow_cpu_fallback: true
+  max_new_tokens: 96
+  num_beams: 2
+
+tts:
+  voice: tts/models/export/hi_official_v1/voice.onnx
+  sample_rate: 22050
+
+playback:
+  device: null
+  keep_wavs: false
+
+runtime:
+  spill_dir: pipeline/spill
+  log_latency: true
+  log_level: INFO

@@ -14,20 +14,26 @@ Requires:
 """
 from __future__ import annotations
 
-import argparse
-import os
-import subprocess
 import sys
-import tempfile
-import time
 from pathlib import Path
 
-import numpy as np
-import soundfile as sf
-import torch
-from dotenv import load_dotenv
-
 ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT))
+from pipeline._bootstrap import ensure_venv_on_path  # noqa: E402
+
+ensure_venv_on_path()
+
+import argparse  # noqa: E402
+import os  # noqa: E402
+import subprocess  # noqa: E402
+import tempfile  # noqa: E402
+import time  # noqa: E402
+
+import numpy as np  # noqa: E402
+import soundfile as sf  # noqa: E402
+import torch  # noqa: E402
+from dotenv import load_dotenv  # noqa: E402
+
 sys.path.insert(0, str(ROOT / "stt" / "src"))
 
 

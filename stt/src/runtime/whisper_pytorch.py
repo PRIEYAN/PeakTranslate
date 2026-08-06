@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import io
+import threading
 from pathlib import Path
 from typing import Optional
 
@@ -10,6 +11,17 @@ import torch
 from transformers import WhisperForConditionalGeneration, WhisperProcessor
 
 from .messages import AudioChunk, Transcript
+
+# transformers' `from_pretrained` suppresses weight tying by monkeypatching
+# `PreTrainedModel.tie_weights`, which is process-global state. Two threads
+# loading models at once can therefore swallow each other's tie call, leaving
+# tied weights (here `proj_out.weight`) as the unmaterialized meta-device
+# placeholders the skeleton was built from — which then blow up on
+# `.to(device)`. See docs/06-debugging-meta-tensor-load-race.md.
+# Callers that load other transformers models concurrently must pass their own
+# shared lock as `load_lock`; this default only guards WhisperPytorchSTT
+# instances against each other.
+_DEFAULT_LOAD_LOCK = threading.Lock()
 
 
 class WhisperPytorchSTT:
@@ -23,6 +35,7 @@ class WhisperPytorchSTT:
         language: Optional[str] = None,
         task: str = "transcribe",
         beam_size: int = 1,
+        load_lock: Optional[threading.Lock] = None,
     ) -> None:
         if allow_cpu_fallback:
             raise ValueError("STT policy forbids CPU fallback (allow_cpu_fallback must be false)")
@@ -36,10 +49,23 @@ class WhisperPytorchSTT:
         self.task = task
         self.beam_size = beam_size
         path = str(model_path)
-        self.processor = WhisperProcessor.from_pretrained(path)
-        self.model = WhisperForConditionalGeneration.from_pretrained(path)
-        self.model.to(self.device)
+        with load_lock if load_lock is not None else _DEFAULT_LOAD_LOCK:
+            self.processor = WhisperProcessor.from_pretrained(path)
+            self.model = WhisperForConditionalGeneration.from_pretrained(path)
+            unmaterialized = [n for n, t in self.model.named_parameters() if t.is_meta]
+            if unmaterialized:
+                raise RuntimeError(
+                    f"Whisper load left parameters on the meta device: {unmaterialized}. "
+                    "See docs/06-debugging-meta-tensor-load-race.md."
+                )
+            self.model.to(self.device)
         self.model.eval()
+        # This export is fp16 (config.json "dtype": "float16") and transformers
+        # honours that on load, but WhisperFeatureExtractor always emits fp32
+        # mel features. Feeding those straight in fails at the first conv with
+        # "Input type (float) and bias type (c10::Half) should be the same",
+        # so remember the weight dtype and cast inputs to match it.
+        self.dtype = self.model.dtype
 
     def warmup(self) -> None:
         sr = 16000
@@ -80,7 +106,7 @@ class WhisperPytorchSTT:
             sampling_rate=sample_rate,
             return_tensors="pt",
         )
-        input_features = inputs.input_features.to(self.device)
+        input_features = inputs.input_features.to(self.device, dtype=self.dtype)
         gen_kwargs = {
             "max_new_tokens": 225,
             "num_beams": self.beam_size,
