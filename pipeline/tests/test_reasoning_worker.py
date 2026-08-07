@@ -160,18 +160,23 @@ def test_jarvis_mode_then_sticky_translate_then_reset_on_new_command():
 
     assert len(prompts) == 3
     assert prompts[0].user_text == "translate everything into tamil"
+    assert prompts[0].history == ()
     assert "MODE: mode_set" in prompts[0].system
     assert "TARGET_LANG: tamil" in prompts[0].system
+    assert prompts[1].history == ()
     assert "MODE: sticky_translate" in prompts[1].system
     assert "TARGET_LANG: tamil" in prompts[1].system
     assert prompts[1].user_text == "hello friends"
     assert prompts[2].user_text == "what is a blockchain"
+    assert prompts[2].history == ()
     assert "MODE: sticky_translate" not in prompts[2].system
     assert "MODE: mode_set" not in prompts[2].system
     assert session.mode is None
-    # Last Jarvis command cleared history before the reply, then stored only that exchange.
+    # Translate turns are not stored; only the post-reset Jarvis command is.
     snap = history.snapshot()
+    assert len(snap) == 2
     assert snap[0].content == "what is a blockchain"
+    assert snap[1].content == "ok."
 
 
 def test_history_ttl_clears_stale_memory_before_reply(monkeypatch):

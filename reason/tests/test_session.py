@@ -11,6 +11,7 @@ def test_mode_set_reply_is_translation_of_command_phrase():
     assert turn.user_text == "translate everything to tamil"
     assert "MODE: mode_set" in turn.system_extra
     assert "TARGET_LANG: tamil" in turn.system_extra
+    assert turn.store_history is False
 
 
 def test_wake_word_must_be_at_sentence_start():
@@ -46,6 +47,7 @@ def test_sticky_mode_applies_without_wake_word():
     assert turn.user_text == "good morning friends"
     assert "MODE: sticky_translate" in turn.system_extra
     assert "TARGET_LANG: tamil" in turn.system_extra
+    assert turn.store_history is False
     assert s.mode is not None
 
 
@@ -58,6 +60,7 @@ def test_new_jarvis_question_clears_mode_and_requests_history_reset():
     assert s.mode is None
     assert turn.user_text == "what is a blockchain"
     assert turn.system_extra == ""
+    assert turn.store_history is True
 
 
 def test_translate_to_english_short_form():

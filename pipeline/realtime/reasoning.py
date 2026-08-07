@@ -161,7 +161,7 @@ def reasoning_worker(
             prompt = Prompt(
                 user_text=turn.user_text,
                 system=system,
-                history=history.snapshot(),
+                history=history.snapshot() if turn.store_history else (),
             )
             # gpu_lock held for the whole generation: reasoning is the only
             # GPU consumer besides STT. Without barge-in, capture is muted
@@ -207,7 +207,8 @@ def reasoning_worker(
                 emit(s, is_last=False)
             emit("", is_last=True)  # end-of-utterance marker; TTS skips empties
             reply = "".join(full).strip()
-            history.add_exchange(turn.user_text, reply)
+            if turn.store_history:
+                history.add_exchange(turn.user_text, reply)
             log.info(
                 "[%s] reply (%.0f ms, %d chunks): %r",
                 sent.utt_id,

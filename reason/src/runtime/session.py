@@ -7,8 +7,10 @@ Wake word ``jarvis`` changes how the assistant behaves:
 - ``jarvis what is a blockchain`` → new Jarvis command: clear chat history,
   clear any sticky mode, answer the question as a normal assistant.
 
-Chat history (ConversationHistory) is turn memory. Sticky mode lives here so
-a 30s history TTL cannot wipe a standing order the user just set.
+Chat history (ConversationHistory) is turn memory for normal assistant mode only.
+Sticky translate mode stores the standing order in JarvisSession — not model outputs.
+Translate turns never add exchanges to history (stateless per utterance).
+Any new Jarvis wake clears history and sticky mode before handling the command.
 """
 from __future__ import annotations
 
@@ -58,11 +60,13 @@ _DYNAMIC_SYSTEM_EXTRA = """\
 MODE: {mode}
 TARGET_LANG: {lang}
 
+TRANSLATE-ONLY SESSION (active until the user says Jarvis again).
 You are in a voice pipeline. Output ONLY what should be spoken.
+Suspend all other assistant behavior — no chat, no Q&A, no advice, no memory of prior turns.
 
 Rules:
 1. Reply entirely in TARGET_LANG. No English unless TARGET_LANG is English.
-2. Translate meaning, do not answer as a chatbot, do not confirm, greet, explain, or add extras.
+2. Translate meaning only. Do not answer as a chatbot, confirm, greet, explain, or add extras.
 3. At most two short spoken sentences.
 4. Script choice (automatic):
    - If TARGET_LANG has a native writing system the speech engine can read (e.g. Hindi Devanagari), use that script.
@@ -91,6 +95,7 @@ class JarvisTurn:
     system_extra: str
     reset_history: bool
     mode: Optional[StickyMode]  # current sticky mode after this turn
+    store_history: bool = True  # False in translate-only mode (no reply memory)
     log_note: str = ""
 
 
@@ -117,6 +122,7 @@ def _extract_mode(command: str) -> Optional[StickyMode]:
     return None
 
 
+
 class JarvisSession:
     """Owns sticky mode. Chat history stays in ConversationHistory."""
 
@@ -141,6 +147,7 @@ class JarvisSession:
                     system_extra="The user only said your name. Ask briefly how you can help.",
                     reset_history=True,
                     mode=None,
+                    store_history=True,
                     log_note="jarvis wake (no command) — history cleared, mode cleared",
                 )
 
@@ -148,12 +155,11 @@ class JarvisSession:
             if mode is not None:
                 self._mode = mode
                 return JarvisTurn(
-                    # Reply = Tamil (etc.) translation of this exact phrase, e.g.
-                    # "translate everything to tamil" → "tamil-la ellaa parimaanam sei"
                     user_text=command,
                     system_extra=_system_extra("mode_set", mode.target_lang),
                     reset_history=True,
                     mode=mode,
+                    store_history=False,
                     log_note=f"jarvis mode set: translate→{mode.target_lang}",
                 )
 
@@ -164,6 +170,7 @@ class JarvisSession:
                 system_extra="",
                 reset_history=True,
                 mode=None,
+                store_history=True,
                 log_note="jarvis command — history cleared, mode cleared",
             )
 
@@ -174,6 +181,7 @@ class JarvisSession:
                 system_extra=_system_extra("sticky_translate", self._mode.target_lang),
                 reset_history=False,
                 mode=self._mode,
+                store_history=False,
                 log_note=f"sticky translate→{self._mode.target_lang}",
             )
 
