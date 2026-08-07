@@ -18,11 +18,7 @@ from transformers import (
     TextIteratorStreamer,
 )
 
-from .loading import (
-    assert_materialized,
-    build_quantization_config,
-    skip_caching_allocator_warmup,
-)
+from .loading import assert_materialized, build_quantization_config
 from .messages import Prompt
 from .prompting import ChatPromptFormatter
 
@@ -68,23 +64,16 @@ class GemmaPytorchReasoner:
 
         quant = build_quantization_config(quantization, compute_dtype)
         with load_lock if load_lock is not None else _DEFAULT_LOAD_LOCK:
-            # Free any stale CUDA cache from a previous failed load / other
-            # process leftovers before we touch the GPU.
-            torch.cuda.empty_cache()
             tok = AutoTokenizer.from_pretrained(model_id)
-            # See loading.skip_caching_allocator_warmup — required on ≤4 GB
-            # when Whisper is (or was) resident; the stock warmup OOMs.
-            with skip_caching_allocator_warmup():
-                self.model = AutoModelForCausalLM.from_pretrained(
-                    model_id,
-                    quantization_config=quant,
-                    dtype=getattr(torch, compute_dtype),
-                    # Pinned, not "auto": an over-budget model must raise rather
-                    # than silently offload half its layers to CPU (see §5).
-                    device_map={"": 0},
-                )
+            self.model = AutoModelForCausalLM.from_pretrained(
+                model_id,
+                quantization_config=quant,
+                dtype=getattr(torch, compute_dtype),
+                # Pinned, not "auto": an over-budget model must raise rather
+                # than silently offload half its layers to CPU (see §5).
+                device_map={"": 0},
+            )
             assert_materialized(self.model, "reasoning")
-            torch.cuda.empty_cache()
         self.model.eval()
         self.tokenizer = tok
         self.formatter = ChatPromptFormatter(tok)

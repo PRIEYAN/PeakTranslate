@@ -20,6 +20,7 @@ from .history import ConversationHistory
 from .interface import ReasoningEngine
 from .messages import Prompt, Turn
 from .registry import resolve_profile, resolve_prompt_path
+from .session import JarvisSession, JarvisTurn, StickyMode
 
 __all__ = [
     "build_engine",
@@ -28,6 +29,9 @@ __all__ = [
     "Prompt",
     "Turn",
     "ConversationHistory",
+    "JarvisSession",
+    "JarvisTurn",
+    "StickyMode",
 ]
 
 

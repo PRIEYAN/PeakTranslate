@@ -14,6 +14,7 @@ from pathlib import Path
 from pipeline.realtime.messages import STOP, Abort, Sentence
 from pipeline.realtime.reasoning import reasoning_worker
 from reason.src.runtime.history import ConversationHistory
+from reason.src.runtime.session import JarvisSession
 from reason.src.runtime.streaming import SentenceAssembler
 
 
@@ -111,6 +112,57 @@ def test_history_updated_with_the_full_joined_reply():
     snap = history.snapshot()
     assert (snap[0].role, snap[0].content) == ("user", "hello")
     assert (snap[1].role, snap[1].content) == ("assistant", "Hello there. How can I help?")
+
+
+def test_jarvis_mode_then_sticky_translate_then_reset_on_new_command():
+    prompts = []
+
+    class RecordingEngine:
+        def warmup(self):
+            pass
+
+        def stream_reply(self, prompt, *, cancel=None):
+            prompts.append(prompt)
+            yield "ok."
+
+    session = JarvisSession()
+    history = ConversationHistory(max_turns=4)
+    transcript_queue: "queue.Queue" = queue.Queue()
+    reply_queue: "queue.Queue" = queue.Queue()
+    for text in (
+        "jarvis translate everything into tamil",
+        "hello friends",
+        "jarvis what is a blockchain",
+    ):
+        transcript_queue.put(
+            Sentence(utt_id="u", text=text, src_lang="en", t_captured=0.0, t_stt_done=0.0)
+        )
+    transcript_queue.put(STOP)
+
+    reasoning_worker(
+        engine=RecordingEngine(),
+        history=history,
+        assembler_factory=SentenceAssembler,
+        system_prompt="You are Jarvis.",
+        transcript_queue=transcript_queue,
+        reply_queue=reply_queue,
+        gpu_lock=threading.Lock(),
+        stop_event=threading.Event(),
+        history_ttl_s=0.0,
+        session=session,
+    )
+
+    assert len(prompts) == 3
+    assert "standing order" in prompts[0].system.lower()
+    assert "tamil" in prompts[0].system.lower()
+    assert "translate EVERYTHING" in prompts[1].system
+    assert prompts[1].user_text == "hello friends"
+    assert prompts[2].user_text == "what is a blockchain"
+    assert "STANDING ORDER" not in prompts[2].system
+    assert session.mode is None
+    # Last Jarvis command cleared history before the reply, then stored only that exchange.
+    snap = history.snapshot()
+    assert snap[0].content == "what is a blockchain"
 
 
 def test_history_ttl_clears_stale_memory_before_reply(monkeypatch):

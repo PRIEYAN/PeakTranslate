@@ -27,6 +27,7 @@ from .noise import pick_speech_lang, strip_unspeakable
 if TYPE_CHECKING:  # type-only; never imported at runtime, no torch pulled in
     from reason.src.runtime import ConversationHistory
     from reason.src.runtime.interface import ReasoningEngine
+    from reason.src.runtime.session import JarvisSession
     from reason.src.runtime.streaming import SentenceAssembler
 
 log = logging.getLogger("peaktranslation.realtime")
@@ -48,8 +49,12 @@ def reasoning_worker(
     speaking: Optional[threading.Event] = None,
     interrupt_event: Optional[threading.Event] = None,
     history_ttl_s: float = 30.0,
+    session: Optional["JarvisSession"] = None,
 ) -> None:
     from reason.src.runtime import Prompt
+    from reason.src.runtime.session import JarvisSession as _JarvisSession
+
+    jarvis = session if session is not None else _JarvisSession()
 
     try:
         engine.warmup()
@@ -60,9 +65,8 @@ def reasoning_worker(
         reply_queue.put(STOP)
         return
 
-    # Wall-clock memory refresh: stale multi-turn context is a common cause of
-    # Gemma drifting / hallucinating after a few noisy exchanges. 0/negative
-    # disables. Checked on idle ticks and before every reply.
+    # Wall-clock chat-history refresh only — sticky Jarvis mode is NOT cleared
+    # here (only a new "jarvis …" command clears/replaces it).
     history_epoch = time.monotonic()
 
     def maybe_refresh_history() -> None:
@@ -75,8 +79,9 @@ def reasoning_worker(
         if history.snapshot():
             history.clear()
             log.info(
-                "Reasoning memory refreshed (ttl=%.0fs) — clearing conversation history.",
+                "Reasoning chat history refreshed (ttl=%.0fs); sticky Jarvis mode kept=%s.",
                 history_ttl_s,
+                jarvis.mode.target_lang if jarvis.mode else "none",
             )
         history_epoch = now
 
@@ -97,6 +102,17 @@ def reasoning_worker(
             interrupt_event.clear()
 
         maybe_refresh_history()
+
+        turn = jarvis.route(sent.text)
+        if turn.reset_history:
+            history.clear()
+            history_epoch = time.monotonic()
+        if turn.log_note:
+            log.info("[%s] Jarvis: %s", sent.utt_id, turn.log_note)
+
+        system = system_prompt
+        if turn.system_extra:
+            system = f"{system_prompt}\n\n{turn.system_extra}".strip()
 
         t0 = time.perf_counter()
         assembler = assembler_factory()
@@ -134,7 +150,9 @@ def reasoning_worker(
             if speaking is not None:
                 speaking.set()  # see doc §14 (mute) / §19 (barge-in signal)
             prompt = Prompt(
-                user_text=sent.text, system=system_prompt, history=history.snapshot()
+                user_text=turn.user_text,
+                system=system,
+                history=history.snapshot(),
             )
             # gpu_lock held for the whole generation: reasoning is the only
             # GPU consumer besides STT. Without barge-in, capture is muted
@@ -179,7 +197,7 @@ def reasoning_worker(
                 emit(s, is_last=False)
             emit("", is_last=True)  # end-of-utterance marker; TTS skips empties
             reply = "".join(full).strip()
-            history.add_exchange(sent.text, reply)
+            history.add_exchange(turn.user_text, reply)
             log.info(
                 "[%s] reply (%.0f ms, %d chunks): %r",
                 sent.utt_id,

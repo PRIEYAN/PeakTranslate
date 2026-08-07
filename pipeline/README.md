@@ -128,9 +128,16 @@ venv/bin/python pipeline/run_realtime.py --mode reason --stage mt --device 19
 venv/bin/python pipeline/run_realtime.py --mode reason --stage full --device 19
 ```
 
-Jarvis-style assistant: Gemma answers in the language you ask for
-("explain blockchain in Tamil" → Tamil via Latin transliteration for
-speech; Hindi → Devanagari + Hindi Piper). No MarianMT in this mode.
+Jarvis wake word controls sticky behaviour (stored separately from chat
+history):
+
+- `jarvis translate everything into tamil` → confirm, then every later
+  utterance is translated to Tamil until the next Jarvis command
+- `jarvis what is a blockchain` → clears that mode + chat memory, answers
+  the question
+
+Hindi replies use Devanagari + Hindi Piper; Tamil uses Latin transliteration
++ English Piper (no Tamil Piper voice in-repo). No MarianMT in this mode.
 
 Noise control (USB mics): stricter VAD, quiet-utterance drop, and a
 filler filter that discards Whisper hallucinations like `"you"` / `"Bye"`
