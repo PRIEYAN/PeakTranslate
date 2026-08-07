@@ -49,7 +49,15 @@ class InterruptingEngine:
             yield delta
 
 
-def _run_worker(engine, *, speaking=None, history=None, interrupt_event=None, sentence=None):
+def _run_worker(
+    engine,
+    *,
+    speaking=None,
+    history=None,
+    interrupt_event=None,
+    sentence=None,
+    history_ttl_s=0.0,
+):
     transcript_queue: "queue.Queue" = queue.Queue()
     reply_queue: "queue.Queue" = queue.Queue()
     history = history or ConversationHistory(max_turns=4)
@@ -70,6 +78,7 @@ def _run_worker(engine, *, speaking=None, history=None, interrupt_event=None, se
         stop_event=threading.Event(),
         speaking=speaking,
         interrupt_event=interrupt_event,
+        history_ttl_s=history_ttl_s,
     )
 
     out = []
@@ -102,6 +111,60 @@ def test_history_updated_with_the_full_joined_reply():
     snap = history.snapshot()
     assert (snap[0].role, snap[0].content) == ("user", "hello")
     assert (snap[1].role, snap[1].content) == ("assistant", "Hello there. How can I help?")
+
+
+def test_history_ttl_clears_stale_memory_before_reply(monkeypatch):
+    """Stale turns from noise/hallucination must not poison the next prompt."""
+    history = ConversationHistory(max_turns=4)
+    history.add_exchange("you", "नमस्ते")
+    assert history.snapshot()
+
+    clock = {"t": 0.0}
+    monkeypatch.setattr(
+        "pipeline.realtime.reasoning.time.monotonic", lambda: clock["t"]
+    )
+
+    seen_history = {}
+
+    class RecordingEngine:
+        def warmup(self):
+            pass
+
+        def stream_reply(self, prompt, *, cancel=None):
+            seen_history["turns"] = prompt.history
+            yield "Fresh."
+
+    transcript_queue: "queue.Queue" = queue.Queue()
+    reply_queue: "queue.Queue" = queue.Queue()
+    transcript_queue.put(
+        Sentence(utt_id="u1", text="explain blockchain", src_lang="en", t_captured=0.0, t_stt_done=0.0)
+    )
+    transcript_queue.put(STOP)
+
+    real_get = transcript_queue.get
+
+    def get_and_age(*args, **kwargs):
+        item = real_get(*args, **kwargs)
+        clock["t"] = 31.0  # past history_ttl_s=30 before maybe_refresh_history
+        return item
+
+    monkeypatch.setattr(transcript_queue, "get", get_and_age)
+
+    reasoning_worker(
+        engine=RecordingEngine(),
+        history=history,
+        assembler_factory=SentenceAssembler,
+        system_prompt="Be brief.",
+        transcript_queue=transcript_queue,
+        reply_queue=reply_queue,
+        gpu_lock=threading.Lock(),
+        stop_event=threading.Event(),
+        history_ttl_s=30.0,
+    )
+
+    assert seen_history["turns"] == ()
+    snap = history.snapshot()
+    assert [t.content for t in snap] == ["explain blockchain", "Fresh."]
 
 
 def test_speaking_set_during_reply_and_not_cleared_by_the_worker():

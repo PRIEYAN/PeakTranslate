@@ -1104,7 +1104,7 @@ Each step is independently verifiable, so a failure tells you which layer broke.
 | Symptom | Cause | Fix |
 |---|---|---|
 | `401 ... access to model is restricted` | licence not accepted, or `HF_TOKEN` unset | §6 |
-| `CUDA out of memory` on load | bf16 instead of 4-bit, or Marian still loaded | §5 |
+| `CUDA out of memory` on load | Whisper loaded before Gemma on a 4 GB card, or bf16 instead of 4-bit, or Marian still loaded | Load Gemma before STT (`run_realtime.py`); skip `caching_allocator_warmup` (§10); stay on `nf4` (§5) |
 | Loads fine but ~30 s per reply | `device_map="auto"` offloaded layers to CPU | pin `device_map={"": 0}` |
 | `Tokenizer has no chat template` | base model, not `-it` | §6 — use an `-it` variant |
 | Replies ramble or restate the question | base model, or system prompt not applied | §6, §10 |

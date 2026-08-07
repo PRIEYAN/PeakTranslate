@@ -320,8 +320,22 @@ def tts_worker(
             continue
         tr: Translation | Reply = item
         if not tr.text.strip():
-            # Reason mode's end-of-utterance marker (Reply.is_last with empty
-            # text) and any other empty chunk land here — nothing to speak.
+            # Reason mode emits an empty Reply(is_last=True) as the
+            # end-of-utterance marker (reasoning.py). Skip synthesis, but
+            # still forward a marker WavJob so playback can clear `speaking`
+            # — otherwise every content chunk has is_last=False and the mic
+            # stays muted forever after the first reply.
+            if getattr(tr, "is_last", False):
+                wav_queue.put(
+                    WavJob(
+                        utt_id=tr.utt_id,
+                        wav_path=None,
+                        sample_rate=sample_rate,
+                        t_captured=tr.t_captured,
+                        t_tts_done=time.perf_counter(),
+                        is_last=True,
+                    )
+                )
             continue
 
         # `seq` defaults to 0 for Translation (one chunk per utterance, byte-
@@ -381,6 +395,14 @@ def playback_worker(
             log.info("[%s] Reply aborted by barge-in.", item.utt_id)
             continue
         job: WavJob = item
+
+        # Marker-only job from TTS (empty Reply.is_last): nothing to play,
+        # but this is the signal that clears the mic mute.
+        if job.wav_path is None:
+            if speaking is not None and job.is_last:
+                time.sleep(0.2)
+                speaking.clear()
+            continue
 
         if log_latency:
             total_ms = (time.perf_counter() - job.t_captured) * 1000

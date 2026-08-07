@@ -7,6 +7,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Optional
 
 # Sentinel pushed through every queue, in pipeline order, to trigger a clean
 # shutdown of the worker that owns that queue.
@@ -78,7 +79,10 @@ class Abort:
 @dataclass
 class WavJob:
     utt_id: str
-    wav_path: Path
+    # None for reason mode's empty end-of-utterance marker: nothing to play,
+    # but playback still needs the job so it can clear `speaking` (doc §14).
+    # TTS must forward that marker — dropping it leaves the mic muted forever.
+    wav_path: Optional[Path]
     sample_rate: int
     t_captured: float
     t_tts_done: float

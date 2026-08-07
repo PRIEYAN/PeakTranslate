@@ -47,6 +47,7 @@ def reasoning_worker(
     out_lang: str = "en",
     speaking: Optional[threading.Event] = None,
     interrupt_event: Optional[threading.Event] = None,
+    history_ttl_s: float = 30.0,
 ) -> None:
     from reason.src.runtime import Prompt
 
@@ -59,10 +60,31 @@ def reasoning_worker(
         reply_queue.put(STOP)
         return
 
+    # Wall-clock memory refresh: stale multi-turn context is a common cause of
+    # Gemma drifting / hallucinating after a few noisy exchanges. 0/negative
+    # disables. Checked on idle ticks and before every reply.
+    history_epoch = time.monotonic()
+
+    def maybe_refresh_history() -> None:
+        nonlocal history_epoch
+        if history_ttl_s <= 0:
+            return
+        now = time.monotonic()
+        if now - history_epoch < history_ttl_s:
+            return
+        if history.snapshot():
+            history.clear()
+            log.info(
+                "Reasoning memory refreshed (ttl=%.0fs) — clearing conversation history.",
+                history_ttl_s,
+            )
+        history_epoch = now
+
     while not stop_event.is_set():
         try:
             item = transcript_queue.get(timeout=_GET_TIMEOUT_S)
         except queue.Empty:
+            maybe_refresh_history()
             continue
         if item is STOP:
             reply_queue.put(STOP)
@@ -73,6 +95,8 @@ def reasoning_worker(
         # it (doc §19).
         if interrupt_event is not None:
             interrupt_event.clear()
+
+        maybe_refresh_history()
 
         t0 = time.perf_counter()
         assembler = assembler_factory()

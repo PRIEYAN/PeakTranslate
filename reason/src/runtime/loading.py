@@ -7,7 +7,8 @@ scripts/bench_reason.py). See docs/06-debugging-meta-tensor-load-race.md.
 """
 from __future__ import annotations
 
-from typing import Any, Optional
+from contextlib import contextmanager
+from typing import Any, Iterator, Optional
 
 
 def build_quantization_config(kind: Optional[str], compute_dtype: str) -> Optional[Any]:
@@ -35,3 +36,23 @@ def assert_materialized(model, what: str) -> None:
             f"{what} load left parameters on the meta device: {unmaterialized}. "
             "See docs/06-debugging-meta-tensor-load-race.md."
         )
+
+
+@contextmanager
+def skip_caching_allocator_warmup() -> Iterator[None]:
+    """Disable transformers' CUDA pre-malloc during `from_pretrained`.
+
+    On a 4 GB card that already holds Whisper, `caching_allocator_warmup`
+    still tries to reserve ~model-size bytes based on *total* device memory
+    (capped at total−1.2 GiB), not *free* memory — so it OOMs even when the
+    4-bit weights themselves would fit. Skipping the warmup only slows the
+    load a little; the weights still land correctly.
+    """
+    import transformers.modeling_utils as mu
+
+    original = mu.caching_allocator_warmup
+    mu.caching_allocator_warmup = lambda *args, **kwargs: None  # noqa: E731
+    try:
+        yield
+    finally:
+        mu.caching_allocator_warmup = original

@@ -1,8 +1,13 @@
 """Infrastructure layer — torch is allowed here, but none of this needs CUDA."""
 import pytest
 import torch
+import transformers.modeling_utils as mu
 
-from reason.src.runtime.loading import assert_materialized, build_quantization_config
+from reason.src.runtime.loading import (
+    assert_materialized,
+    build_quantization_config,
+    skip_caching_allocator_warmup,
+)
 
 
 class FakeModel:
@@ -38,3 +43,11 @@ def test_assert_materialized_passes_for_real_tensors():
 def test_assert_materialized_raises_and_names_the_parameter():
     with pytest.raises(RuntimeError, match="weight"):
         assert_materialized(FakeModel(meta=True), "test")
+
+
+def test_skip_caching_allocator_warmup_restores_original():
+    original = mu.caching_allocator_warmup
+    with skip_caching_allocator_warmup():
+        assert mu.caching_allocator_warmup is not original
+        mu.caching_allocator_warmup("model", {}, None)  # no-op must not raise
+    assert mu.caching_allocator_warmup is original

@@ -20,6 +20,7 @@ profiles:
       temperature: 0.6
       top_p: 0.9
     history_turns: 4                   # 0 disables multi-turn context
+    history_ttl_s: 30                  # clear memory every N seconds (0 = never)
 
   gemma-2b-it-4bit:                    # older model, same shape, smaller
     model_id: google/gemma-2b-it
@@ -34,3 +35,4 @@ profiles:
       temperature: 0.6
       top_p: 0.9
     history_turns: 4
+    history_ttl_s: 30

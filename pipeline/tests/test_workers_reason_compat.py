@@ -1,6 +1,7 @@
 """Changes to workers.py needed only because reason mode streams several Q2
 items per utterance (docs/reasoningModel/01-gemma-reasoning-mode.md §12):
-seq-suffixed WAV filenames, skipping empty chunks, and playback clearing
+seq-suffixed WAV filenames, skipping empty non-last chunks, forwarding the
+empty is_last marker so playback can clear `speaking`, and playback clearing
 `speaking` only after the last chunk. Translate-mode inputs (`Translation`,
 default `seq=0`/`is_last=True`) must be unaffected by all three.
 """
@@ -25,13 +26,16 @@ def _drain(q: "queue.Queue") -> list:
 
 
 def test_tts_worker_skips_empty_chunks(monkeypatch, tmp_path):
+    # Empty non-last chunks are dropped entirely (nothing to speak, nothing
+    # for playback to do). The empty is_last marker is different — see
+    # test_tts_forwards_empty_is_last_marker_so_speaking_can_clear.
     calls = []
     monkeypatch.setattr(workers, "_piper_synth", lambda text, voice, out: calls.append(text))
 
     translation_queue: "queue.Queue" = queue.Queue()
     wav_queue: "queue.Queue" = queue.Queue()
     translation_queue.put(
-        Reply(utt_id="u1", text="", seq=2, is_last=True, out_lang="en", t_captured=0.0, t_reply_done=0.0)
+        Reply(utt_id="u1", text="", seq=2, is_last=False, out_lang="en", t_captured=0.0, t_reply_done=0.0)
     )
     translation_queue.put(STOP)
 
@@ -46,6 +50,56 @@ def test_tts_worker_skips_empty_chunks(monkeypatch, tmp_path):
     assert calls == []
     jobs = _drain(wav_queue)
     assert jobs == [STOP]
+
+
+def test_tts_forwards_empty_is_last_marker_so_speaking_can_clear(monkeypatch, tmp_path):
+    # Regression: reason mode emits content chunks with is_last=False, then
+    # an empty Reply(is_last=True) marker. TTS must not synthesize the
+    # marker, but MUST forward a WavJob(is_last=True) — otherwise playback
+    # never clears `speaking` and the mic stays muted after the first reply.
+    calls = []
+    monkeypatch.setattr(workers, "_piper_synth", lambda text, voice, out: calls.append(text))
+    monkeypatch.setattr("pipeline.realtime.audio_out.play_wav_blocking", lambda path, interrupt=None: None)
+    monkeypatch.setattr(time, "sleep", lambda s: None)
+
+    speaking = threading.Event()
+    speaking.set()
+    translation_queue: "queue.Queue" = queue.Queue()
+    wav_queue: "queue.Queue" = queue.Queue()
+    translation_queue.put(
+        Reply(utt_id="u1", text="I am well, thank you.", seq=0, is_last=False, out_lang="en", t_captured=0.0, t_reply_done=0.0)
+    )
+    translation_queue.put(
+        Reply(utt_id="u1", text="How can I help you?", seq=1, is_last=False, out_lang="en", t_captured=0.0, t_reply_done=0.0)
+    )
+    translation_queue.put(
+        Reply(utt_id="u1", text="", seq=2, is_last=True, out_lang="en", t_captured=0.0, t_reply_done=0.0)
+    )
+    translation_queue.put(STOP)
+
+    workers.tts_worker(
+        voice_onnx=tmp_path / "voice.onnx",
+        spill_dir=tmp_path,
+        translation_queue=translation_queue,
+        wav_queue=wav_queue,
+        stop_event=threading.Event(),
+    )
+
+    assert calls == ["I am well, thank you.", "How can I help you?"]
+    jobs = [j for j in _drain(wav_queue) if j is not STOP]
+    assert len(jobs) == 3
+    assert jobs[0].is_last is False and jobs[0].wav_path is not None
+    assert jobs[1].is_last is False and jobs[1].wav_path is not None
+    assert jobs[2].is_last is True and jobs[2].wav_path is None
+
+    wav_queue2: "queue.Queue" = queue.Queue()
+    for j in jobs:
+        wav_queue2.put(j)
+    wav_queue2.put(STOP)
+    workers.playback_worker(
+        wav_queue=wav_queue2, stop_event=threading.Event(), keep_wavs=True, speaking=speaking,
+    )
+    assert not speaking.is_set()
 
 
 def test_tts_worker_wav_filename_includes_seq_for_reply_chunks(monkeypatch, tmp_path):

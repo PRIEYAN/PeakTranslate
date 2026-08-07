@@ -291,6 +291,37 @@ def main() -> int:
         threads.append(t)
 
     else:
+        # Reason mode: load Gemma *before* starting the STT thread. On a 4 GB
+        # card Whisper claims ~2.5 GB first; Gemma's from_pretrained warmup
+        # then tries to reserve another ~2 GB against total (not free) VRAM
+        # and OOMs. Gemma-first leaves enough room for Whisper afterward.
+        reason_engine = None
+        reason_profile = None
+        if mode == "reason" and args.stage in ("mt", "full"):
+            from reason.src.runtime import build_engine, load_system_prompt
+            from reason.src.runtime.registry import resolve_profile
+
+            r_cfg = cfg["reason"]
+            profile_id = args.reason_profile or r_cfg["profile"]
+            reason_profile = resolve_profile(profile_id)
+            log.info("Loading reasoning model before STT (4 GB VRAM budget)...")
+            # Built on the main thread: a bad profile / missing licence / OOM
+            # fails here — before the mic opens — with a clean traceback.
+            # Same MODEL_LOAD_LOCK STT uses (docs/06).
+            reason_engine = build_engine(profile_id, load_lock=MODEL_LOAD_LOCK)
+            try:
+                import torch
+
+                torch.cuda.empty_cache()
+                free, total = torch.cuda.mem_get_info()
+                log.info(
+                    "Reasoning model loaded. VRAM free/total: %.2f / %.2f GiB",
+                    free / (1024**3),
+                    total / (1024**3),
+                )
+            except Exception:
+                pass
+
         t_stt = threading.Thread(
             target=stt_worker,
             name="stt",
@@ -328,29 +359,17 @@ def main() -> int:
         else:
             if mode == "reason":
                 from pipeline.realtime.reasoning import reasoning_worker
-                from reason.src.runtime import ConversationHistory, build_engine, load_system_prompt
-                from reason.src.runtime.registry import resolve_profile
+                from reason.src.runtime import ConversationHistory, load_system_prompt
                 from reason.src.runtime.streaming import SentenceAssembler
 
-                r_cfg = cfg["reason"]
-                profile_id = args.reason_profile or r_cfg["profile"]
-                # out_lang / history_turns are model knobs and live in the
-                # profile (reason/configs/profiles.yaml), not the pipeline
-                # config — see doc §8.
-                profile = resolve_profile(profile_id)
-                # Built on the main thread, not inside the worker: a bad
-                # profile, missing licence, or CUDA OOM fails here — before
-                # the mic opens — with a clean traceback instead of a dead
-                # daemon thread. Injected with the SAME lock STT uses, since
-                # a lock only helps if every racing thread takes the same
-                # one (docs/06-debugging-meta-tensor-load-race.md).
-                engine = build_engine(profile_id, load_lock=MODEL_LOAD_LOCK)
+                profile_id = args.reason_profile or cfg["reason"]["profile"]
+                profile = reason_profile  # resolved above, before STT load
                 t_text = threading.Thread(
                     target=reasoning_worker,
                     name="reason",
                     daemon=True,
                     kwargs=dict(
-                        engine=engine,
+                        engine=reason_engine,
                         history=ConversationHistory(max_turns=profile.get("history_turns", 4)),
                         assembler_factory=SentenceAssembler,
                         system_prompt=load_system_prompt(profile_id),
@@ -364,6 +383,9 @@ def main() -> int:
                         # is what's actually muting capture (barge_in=False).
                         speaking=speaking,
                         interrupt_event=interrupt_event if barge_in else None,
+                        # Stale history makes Gemma drift; wipe every N seconds
+                        # (reason/configs/profiles.yaml history_ttl_s).
+                        history_ttl_s=float(profile.get("history_ttl_s", 30)),
                     ),
                 )
             else:
