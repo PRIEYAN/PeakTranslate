@@ -50,6 +50,8 @@ def reasoning_worker(
     interrupt_event: Optional[threading.Event] = None,
     history_ttl_s: float = 30.0,
     session: Optional["JarvisSession"] = None,
+    history_epoch_ref: Optional[list[float]] = None,
+    reset_memory_on_barge_in: bool = True,
 ) -> None:
     from reason.src.runtime import Prompt
     from reason.src.runtime.session import JarvisSession as _JarvisSession
@@ -66,15 +68,22 @@ def reasoning_worker(
         return
 
     # Wall-clock chat-history refresh only — sticky Jarvis mode is NOT cleared
-    # here (only a new "jarvis …" command clears/replaces it).
-    history_epoch = time.monotonic()
+    # by TTL (only jarvis commands or barge-in reset it).
+    epoch_ref: list[float] = history_epoch_ref if history_epoch_ref is not None else [time.monotonic()]
+
+    def reset_memory(where: str) -> None:
+        if not reset_memory_on_barge_in:
+            return
+        history.clear()
+        jarvis.clear_mode()
+        epoch_ref[0] = time.monotonic()
+        log.info("Reason memory reset (%s).", where)
 
     def maybe_refresh_history() -> None:
-        nonlocal history_epoch
         if history_ttl_s <= 0:
             return
         now = time.monotonic()
-        if now - history_epoch < history_ttl_s:
+        if now - epoch_ref[0] < history_ttl_s:
             return
         if history.snapshot():
             history.clear()
@@ -83,7 +92,7 @@ def reasoning_worker(
                 history_ttl_s,
                 jarvis.mode.target_lang if jarvis.mode else "none",
             )
-        history_epoch = now
+        epoch_ref[0] = now
 
     while not stop_event.is_set():
         try:
@@ -106,7 +115,7 @@ def reasoning_worker(
         turn = jarvis.route(sent.text)
         if turn.reset_history:
             history.clear()
-            history_epoch = time.monotonic()
+            epoch_ref[0] = time.monotonic()
         if turn.log_note:
             log.info("[%s] Jarvis: %s", sent.utt_id, turn.log_note)
 
@@ -177,6 +186,7 @@ def reasoning_worker(
                     "[%s] reply interrupted by barge-in after %d chunks (%.0f ms).",
                     sent.utt_id, seq, (time.perf_counter() - t0) * 1000,
                 )
+                reset_memory("barge-in during generation")
                 # No flush, no is_last, no history update: the reply is
                 # void, not merely truncated. `Abort` tells tts/playback to
                 # drop anything already in flight for this utt_id — see

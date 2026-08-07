@@ -377,10 +377,12 @@ def playback_worker(
     log_latency: bool = True,
     speaking: Optional[threading.Event] = None,
     interrupt_event: Optional[threading.Event] = None,
+    speaking_started_at: Optional[list[float]] = None,
 ) -> None:
     from .audio_out import play_wav_blocking
 
     log.info("Playback ready.")
+    last_audio_utt: Optional[str] = None
     while not stop_event.is_set():
         try:
             item = wav_queue.get(timeout=_GET_TIMEOUT_S)
@@ -408,6 +410,10 @@ def playback_worker(
             total_ms = (time.perf_counter() - job.t_captured) * 1000
             log.info("[%s] VAD-close -> audio-out: %.0f ms", job.utt_id, total_ms)
 
+        if speaking_started_at is not None and job.utt_id != last_audio_utt:
+            speaking_started_at[0] = time.monotonic()
+            last_audio_utt = job.utt_id
+
         try:
             play_wav_blocking(job.wav_path, interrupt=interrupt_event)
         except Exception:
@@ -419,10 +425,16 @@ def playback_worker(
             # synthesis failure would leave the mic muted forever. A beat
             # late so the tail of the speaker output doesn't leak into the
             # first unmuted frame (docs/reasoningModel/01-gemma-reasoning-
-            # mode.md §14).
-            if speaking is not None and job.is_last:
-                time.sleep(0.2)
-                speaking.clear()
+            # mode.md §14). On barge-in, clear immediately so the mic is
+            # live for the interrupting utterance.
+            if speaking is not None:
+                interrupted = (
+                    interrupt_event is not None and interrupt_event.is_set()
+                )
+                if interrupted or job.is_last:
+                    if job.is_last and not interrupted:
+                        time.sleep(0.2)
+                    speaking.clear()
 
         if not keep_wavs:
             try:

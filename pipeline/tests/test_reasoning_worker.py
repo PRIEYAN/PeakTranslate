@@ -57,11 +57,14 @@ def _run_worker(
     history=None,
     interrupt_event=None,
     sentence=None,
+    session=None,
     history_ttl_s=0.0,
+    reset_memory_on_barge_in=True,
+    history_epoch_ref=None,
 ):
     transcript_queue: "queue.Queue" = queue.Queue()
     reply_queue: "queue.Queue" = queue.Queue()
-    history = history or ConversationHistory(max_turns=4)
+    history = history if history is not None else ConversationHistory(max_turns=4)
 
     transcript_queue.put(
         sentence or Sentence(utt_id="u1", text="hello", src_lang="en", t_captured=0.0, t_stt_done=0.0)
@@ -80,6 +83,9 @@ def _run_worker(
         speaking=speaking,
         interrupt_event=interrupt_event,
         history_ttl_s=history_ttl_s,
+        session=session,
+        history_epoch_ref=history_epoch_ref,
+        reset_memory_on_barge_in=reset_memory_on_barge_in,
     )
 
     out = []
@@ -153,12 +159,15 @@ def test_jarvis_mode_then_sticky_translate_then_reset_on_new_command():
     )
 
     assert len(prompts) == 3
-    assert "standing order" in prompts[0].system.lower()
-    assert "tamil" in prompts[0].system.lower()
-    assert "translate EVERYTHING" in prompts[1].system
+    assert prompts[0].user_text == "translate everything into tamil"
+    assert "MODE: mode_set" in prompts[0].system
+    assert "TARGET_LANG: tamil" in prompts[0].system
+    assert "MODE: sticky_translate" in prompts[1].system
+    assert "TARGET_LANG: tamil" in prompts[1].system
     assert prompts[1].user_text == "hello friends"
     assert prompts[2].user_text == "what is a blockchain"
-    assert "STANDING ORDER" not in prompts[2].system
+    assert "MODE: sticky_translate" not in prompts[2].system
+    assert "MODE: mode_set" not in prompts[2].system
     assert session.mode is None
     # Last Jarvis command cleared history before the reply, then stored only that exchange.
     snap = history.snapshot()
@@ -290,6 +299,37 @@ def test_barge_in_partial_sentences_before_cancel_still_reach_q2():
     aborts = [r for r in out if isinstance(r, Abort)]
     assert [r.text for r in replies] == ["One.", "Two."]
     assert len(aborts) == 1
+
+
+def test_barge_in_resets_jarvis_mode_and_history():
+    interrupt_event = threading.Event()
+    session = JarvisSession()
+    session.route("jarvis translate everything to tamil")
+    assert session.mode is not None
+    history = ConversationHistory(max_turns=4)
+    history.add_exchange("old", "old reply")
+    epoch_ref = [0.0]
+
+    class InterruptingEngine:
+        def warmup(self):
+            pass
+
+        def stream_reply(self, prompt, *, cancel=None):
+            if cancel is not None:
+                cancel.set()
+            yield "partial"
+
+    _run_worker(
+        InterruptingEngine(),
+        interrupt_event=interrupt_event,
+        session=session,
+        history=history,
+        history_ttl_s=0.0,
+        reset_memory_on_barge_in=True,
+        history_epoch_ref=epoch_ref,
+    )
+    assert session.mode is None
+    assert history.snapshot() == ()
 
 
 def test_barge_in_does_not_update_history():

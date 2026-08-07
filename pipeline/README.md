@@ -128,13 +128,16 @@ venv/bin/python pipeline/run_realtime.py --mode reason --stage mt --device 19
 venv/bin/python pipeline/run_realtime.py --mode reason --stage full --device 19
 ```
 
-Jarvis wake word controls sticky behaviour (stored separately from chat
-history):
+Jarvis wake word (sentence must **start** with `jarvis`):
 
-- `jarvis translate everything into tamil` → confirm, then every later
-  utterance is translated to Tamil until the next Jarvis command
-- `jarvis what is a blockchain` → clears that mode + chat memory, answers
-  the question
+- `jarvis translate everything to tamil` → stores translate mode; speaks back
+  the Tamil translation of that phrase (e.g. the command itself in Tamil)
+- then `hello friends` → translated to Tamil (no wake word needed)
+- `jarvis what is a blockchain` → clears mode + memory, answers normally
+
+**Barge-in** (`reason.barge_in: true`): talk while the assistant is speaking —
+audio stops immediately, mic listens, and memory (chat + Jarvis mode) resets.
+If speaker bleed causes false interrupts, raise `capture.vad.speech_start_debounce_ms`.
 
 Hindi replies use Devanagari + Hindi Piper; Tamil uses Latin transliteration
 + English Piper (no Tamil Piper voice in-repo). No MarianMT in this mode.

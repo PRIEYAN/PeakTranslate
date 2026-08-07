@@ -59,10 +59,14 @@ reason:
   voices:
     en: tts/models/export/en_lessac_medium/voice.onnx
     hi: tts/models/export/hi_official_v1/voice.onnx
-  # OFF by default: open speakers + Boya USB cause a barge-in death spiral
-  # (assistant hears itself → "you" → new reply forever). Use headphones
-  # and set true only after noise is under control — see doc §19.
-  barge_in: false
+  # Talk over the assistant while it is speaking: audio stops, mic listens,
+  # chat history + Jarvis sticky mode are reset. Needs the mic live during
+  # playback (disables mute_capture_while_replying). Raise
+  # capture.vad.speech_start_debounce_ms if speaker bleed triggers false cuts.
+  barge_in: true
+  reset_memory_on_barge_in: true
+  # Ignore barge-in for this long after assistant output starts (speaker bleed).
+  barge_in_grace_ms: 900
   mute_capture_while_replying: true
 
 tts:

@@ -131,8 +131,11 @@ def main() -> int:
     # docs/reasoningModel/01-gemma-reasoning-mode.md §19. Requires capture to
     # stay unmuted while replying, which trades away the echo protection
     # `mute_capture_while_replying` gives on open speakers.
-    # Default OFF: open speakers + USB mics cause a barge-in death spiral.
+    # Default OFF in config — enable for interrupt-during-playback (reason mode).
     barge_in = mode == "reason" and bool(cfg.get("reason", {}).get("barge_in", False))
+    reset_memory_on_barge_in = (
+        barge_in and bool(cfg.get("reason", {}).get("reset_memory_on_barge_in", True))
+    )
     mute_while_replying = mode == "reason" and (
         not barge_in and bool(cfg.get("reason", {}).get("mute_capture_while_replying", True))
     )
@@ -202,10 +205,18 @@ def main() -> int:
     # barge-in/failure). Translate mode never touches it, so capture behaves
     # exactly as before. See docs/reasoningModel/01-gemma-reasoning-mode.md §14.
     speaking = threading.Event()
+    speaking_started_at = [0.0]
+    barge_in_grace_s = (
+        float(cfg.get("reason", {}).get("barge_in_grace_ms", 900)) / 1000.0
+        if barge_in
+        else 0.0
+    )
     # Set the instant a barge-in is detected; cleared by reasoning_worker at
     # the start of the next utterance. Only meaningful when barge_in is on —
     # see doc §19.
     interrupt_event = threading.Event()
+    # Shared reason-mode memory (history + Jarvis sticky mode) for barge-in reset.
+    reason_memory: dict = {}
 
     drop_count = {"n": 0}
 
@@ -213,14 +224,31 @@ def main() -> int:
         drop_count["n"] += 1
         log.warning("[%s] Q0 audio_queue full — dropped oldest (total drops: %d)", utt_id, drop_count["n"])
 
+    def reset_reason_memory(where: str) -> None:
+        hist = reason_memory.get("history")
+        sess = reason_memory.get("session")
+        epoch = reason_memory.get("epoch_ref")
+        if hist is None or sess is None:
+            return
+        hist.clear()
+        sess.clear_mode()
+        if epoch is not None:
+            epoch[0] = time.monotonic()
+        log.info("Reason memory reset (%s).", where)
+
     def on_speech_start() -> None:
-        # Fires on every speech onset (one 20ms frame), not just during a
-        # reply — only treat it as a barge-in if the assistant is actually
-        # talking right now. Without acoustic echo cancellation this can
-        # also fire on the assistant's own voice leaking into the mic; see
-        # doc §19 for the tradeoff and how to tune it.
+        # User spoke while assistant audio is playing (or generating).
         if speaking.is_set():
+            # Ignore speaker bleed right after output starts — otherwise
+            # "Understood" from the speakers triggers instant memory wipe.
+            if (
+                barge_in_grace_s > 0
+                and time.monotonic() - speaking_started_at[0] < barge_in_grace_s
+            ):
+                return
             interrupt_event.set()
+            if reset_memory_on_barge_in:
+                reset_reason_memory("barge-in")
 
     cap_cfg = cfg["capture"]
     device = args.device if args.device is not None else cap_cfg.get("device")
@@ -330,28 +358,28 @@ def main() -> int:
                 from pipeline.realtime.reasoning import reasoning_worker
                 from reason.src.runtime import ConversationHistory, build_engine, load_system_prompt
                 from reason.src.runtime.registry import resolve_profile
+                from reason.src.runtime.session import JarvisSession
                 from reason.src.runtime.streaming import SentenceAssembler
 
                 r_cfg = cfg["reason"]
                 profile_id = args.reason_profile or r_cfg["profile"]
-                # out_lang / history_turns are model knobs and live in the
-                # profile (reason/configs/profiles.yaml), not the pipeline
-                # config — see doc §8.
                 profile = resolve_profile(profile_id)
-                # Built on the main thread, not inside the worker: a bad
-                # profile, missing licence, or CUDA OOM fails here — before
-                # the mic opens — with a clean traceback instead of a dead
-                # daemon thread. Injected with the SAME lock STT uses, since
-                # a lock only helps if every racing thread takes the same
-                # one (docs/06-debugging-meta-tensor-load-race.md).
                 engine = build_engine(profile_id, load_lock=MODEL_LOAD_LOCK)
+                reason_history = ConversationHistory(max_turns=profile.get("history_turns", 4))
+                jarvis_session = JarvisSession()
+                history_epoch_ref = [time.monotonic()]
+                reason_memory["history"] = reason_history
+                reason_memory["session"] = jarvis_session
+                reason_memory["epoch_ref"] = history_epoch_ref
                 t_text = threading.Thread(
                     target=reasoning_worker,
                     name="reason",
                     daemon=True,
                     kwargs=dict(
                         engine=engine,
-                        history=ConversationHistory(max_turns=profile.get("history_turns", 4)),
+                        history=reason_history,
+                        session=jarvis_session,
+                        history_epoch_ref=history_epoch_ref,
                         assembler_factory=SentenceAssembler,
                         system_prompt=load_system_prompt(profile_id),
                         transcript_queue=transcript_queue,
@@ -359,14 +387,10 @@ def main() -> int:
                         gpu_lock=gpu_lock,
                         stop_event=stop_event,
                         out_lang=profile.get("out_lang", "en"),
-                        # Always set/cleared: needed for `on_speech_start`'s
-                        # barge-in gate even when `mute_capture_while_replying`
-                        # is what's actually muting capture (barge_in=False).
                         speaking=speaking,
                         interrupt_event=interrupt_event if barge_in else None,
-                        # Stale history makes Gemma drift; wipe every N seconds
-                        # (reason/configs/profiles.yaml history_ttl_s).
                         history_ttl_s=float(profile.get("history_ttl_s", 30)),
+                        reset_memory_on_barge_in=reset_memory_on_barge_in,
                     ),
                 )
             else:
@@ -443,6 +467,7 @@ def main() -> int:
                         log_latency=cfg["runtime"]["log_latency"],
                         speaking=speaking,
                         interrupt_event=interrupt_event if barge_in else None,
+                        speaking_started_at=speaking_started_at if barge_in else None,
                     ),
                 )
                 t_play.start()

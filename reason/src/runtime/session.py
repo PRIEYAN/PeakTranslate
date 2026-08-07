@@ -17,24 +17,27 @@ from dataclasses import dataclass
 from typing import Optional
 
 _WAKE = re.compile(
-    r"^\s*(?:(?:hey|ok|okay|hi)\s+)?jarvis\b[\s,.:\-]*",
+    r"^\s*jarvis\b[\s,.:\-]*",
     re.IGNORECASE,
 )
+
+_LANG_TAIL = r"(?:the\s+)?([a-zA-Z]+)"
 
 # Standing orders that set sticky translate/speak-in mode.
 _MODE_TRANSLATE = re.compile(
     r"(?:translate|convert|switch)\s+"
-    r"(?:everything|all|all\s+(?:speech|audio|text)|anything|any\s+language)?"
-    r".*?\b(?:into|to|in)\s+([a-zA-Z]+)",
+    r"(?:everything(?:\s+that)?(?:\s+(?:i|we))?\s+say|all(?:\s+that)?(?:\s+(?:i|we))?\s+say|"
+    r"everything|all|all\s+(?:speech|audio|text)|anything|any\s+language)?"
+    r".*?\b(?:into|to|in)\s+" + _LANG_TAIL,
     re.IGNORECASE,
 )
 _MODE_ALWAYS = re.compile(
     r"(?:always\s+)?(?:speak|reply|answer|talk|respond)(?:\s+only)?\s+"
-    r"(?:in|into|to)\s+([a-zA-Z]+)",
+    r"(?:in|into|to)\s+" + _LANG_TAIL,
     re.IGNORECASE,
 )
 _MODE_SHORT = re.compile(
-    r"^(?:translate|convert)\s+(?:into|to|in)\s+([a-zA-Z]+)\s*$",
+    r"^(?:translate|convert)\s+(?:into|to|in)\s+" + _LANG_TAIL + r"\s*$",
     re.IGNORECASE,
 )
 
@@ -42,13 +45,33 @@ _LANG_ALIASES = {
     "tamil": "tamil",
     "tamizh": "tamil",
     "ta": "tamil",
+    "telugu": "telugu",
+    "te": "telugu",
     "hindi": "hindi",
     "hin": "hindi",
-    "hi": "hindi",
     "english": "english",
     "en": "english",
     "eng": "english",
 }
+
+_DYNAMIC_SYSTEM_EXTRA = """\
+MODE: {mode}
+TARGET_LANG: {lang}
+
+You are in a voice pipeline. Output ONLY what should be spoken.
+
+Rules:
+1. Reply entirely in TARGET_LANG. No English unless TARGET_LANG is English.
+2. Translate meaning, do not answer as a chatbot, do not confirm, greet, explain, or add extras.
+3. At most two short spoken sentences.
+4. Script choice (automatic):
+   - If TARGET_LANG has a native writing system the speech engine can read (e.g. Hindi Devanagari), use that script.
+   - Otherwise (Tamil, Telugu, Spanish, Japanese, French, German, Chinese, etc. on English TTS): write clear Latin-letter transliteration of spoken TARGET_LANG — no native script, no romaji/kana mix unless Latin is natural for that language (Spanish/French stay in their normal Latin spelling).
+5. Preserve names and numbers. Do not invent content.
+
+MODE:
+- mode_set → translate the user's command phrase into TARGET_LANG only
+- sticky_translate → translate the user's utterance into TARGET_LANG only"""
 
 
 @dataclass(frozen=True)
@@ -56,7 +79,7 @@ class StickyMode:
     """Standing order that applies until the next Jarvis command."""
 
     kind: str  # "translate"
-    target_lang: str  # normalized: tamil | hindi | english
+    target_lang: str  # normalized language name (any supported utterance)
     raw: str  # original user wording
 
 
@@ -72,7 +95,14 @@ class JarvisTurn:
 
 
 def _normalize_lang(token: str) -> Optional[str]:
-    return _LANG_ALIASES.get(token.strip().lower())
+    t = token.strip().lower()
+    if not t or not re.fullmatch(r"[a-z]+", t):
+        return None
+    return _LANG_ALIASES.get(t, t)
+
+
+def _system_extra(mode: str, lang: str) -> str:
+    return _DYNAMIC_SYSTEM_EXTRA.format(mode=mode, lang=lang)
 
 
 def _extract_mode(command: str) -> Optional[StickyMode]:
@@ -85,38 +115,6 @@ def _extract_mode(command: str) -> Optional[StickyMode]:
             continue
         return StickyMode(kind="translate", target_lang=lang, raw=command.strip())
     return None
-
-
-def _translate_system_extra(mode: StickyMode) -> str:
-    lang = mode.target_lang
-    script_rule = {
-        "hindi": "Use Devanagari script.",
-        "tamil": (
-            "Write spoken Tamil in clear Latin-letter transliteration "
-            "(not Tamil script) so English TTS can read it."
-        ),
-        "english": "Use plain English.",
-    }.get(lang, f"Reply in {lang}.")
-    return (
-        f"STANDING ORDER (active until the user says Jarvis again): "
-        f"translate EVERYTHING the user says into {lang}. "
-        f"Do not answer as a chatbot — output only the {lang} translation "
-        f"of their words, in at most two short spoken sentences. {script_rule}"
-    )
-
-
-def _mode_confirm_system_extra(mode: StickyMode) -> str:
-    lang = mode.target_lang
-    script_rule = {
-        "hindi": "Confirm in Hindi (Devanagari).",
-        "tamil": "Confirm in Latin-letter Tamil transliteration.",
-        "english": "Confirm in English.",
-    }.get(lang, f"Confirm in {lang}.")
-    return (
-        f"The user just set a standing order: translate everything they say "
-        f"into {lang} from now on. Briefly confirm you will do that. {script_rule} "
-        f"One short sentence."
-    )
 
 
 class JarvisSession:
@@ -150,8 +148,10 @@ class JarvisSession:
             if mode is not None:
                 self._mode = mode
                 return JarvisTurn(
-                    user_text=f"Standing order: {command}",
-                    system_extra=_mode_confirm_system_extra(mode),
+                    # Reply = Tamil (etc.) translation of this exact phrase, e.g.
+                    # "translate everything to tamil" → "tamil-la ellaa parimaanam sei"
+                    user_text=command,
+                    system_extra=_system_extra("mode_set", mode.target_lang),
                     reset_history=True,
                     mode=mode,
                     log_note=f"jarvis mode set: translate→{mode.target_lang}",
@@ -171,7 +171,7 @@ class JarvisSession:
         if self._mode is not None and self._mode.kind == "translate":
             return JarvisTurn(
                 user_text=raw,
-                system_extra=_translate_system_extra(self._mode),
+                system_extra=_system_extra("sticky_translate", self._mode.target_lang),
                 reset_history=False,
                 mode=self._mode,
                 log_note=f"sticky translate→{self._mode.target_lang}",
